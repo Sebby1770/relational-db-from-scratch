@@ -2,6 +2,22 @@
 
 This schedule assumes focused part-time work. If you only have weekends, treat each week as a phase rather than a calendar week.
 
+## Implementation Snapshot
+
+This repository now includes a broad implementation pass across the full roadmap:
+
+- Weeks 1-2: working SQL parser, CRUD execution, expressions, sorting, limits, and count.
+- Week 3: stable row ids, inline constraints, and catalog-like table/index metadata.
+- Week 4: secondary hash indexes, index maintenance, and `EXPLAIN` access path output.
+- Week 5: scan/filter/project style execution and a simple access-path planner; joins remain a next step.
+- Week 6: `COUNT(*)`, `ORDER BY`, `LIMIT`, table statistics, and simple equality estimates; grouped aggregation remains a next step.
+- Week 7: `BEGIN`, `COMMIT`, `ROLLBACK`, undo logging, and a tested lock manager.
+- Week 8: tested slotted page abstraction for the disk-storage path.
+- Week 9: tested educational B+ tree for search, insert, splits, and range scans.
+- Week 10: tested WAL record format and optimizer statistics module.
+
+The important distinction: this is now a working educational database plus tested internals components. It is not yet a production SQLite clone with durable recovery, concurrent SQL sessions, MVCC snapshots, or a fully cost-based optimizer.
+
 ## Week 1: Minimal In-Memory Database
 
 Deliver:
@@ -210,4 +226,3 @@ Optimizer path:
 Checkpoint:
 
 - The database either survives a crash or starts making data-informed plan choices.
-

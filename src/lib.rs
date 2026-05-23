@@ -1,11 +1,18 @@
+pub mod bplus_tree;
+pub mod concurrency;
 pub mod db;
 pub mod error;
 pub mod execution;
+pub mod index;
+pub mod optimizer;
+pub mod pager;
 pub mod parser;
 pub mod row;
 pub mod schema;
 pub mod storage;
+pub mod transaction;
 pub mod value;
+pub mod wal;
 
 pub use db::Database;
 pub use error::{DbError, Result};

@@ -2,32 +2,62 @@
 
 An educational, SQLite-inspired relational database built in Rust. The project starts as a small in-memory row store and grows toward indexing, query planning, disk pages, transactions, concurrency control, and recovery.
 
-This repository is intentionally designed for learning database internals properly. The early code avoids magic: the parser is hand-written, storage is a simple vector-backed row store, and the execution engine is small enough to inspect in one sitting.
+This repository is intentionally designed for learning database internals properly. The code avoids magic: the parser is hand-written, the in-memory storage engine is inspectable, and the advanced internals are split into small modules with tests.
 
 ## Current Status
 
-Implemented milestone:
+Implemented SQL-facing features:
 
 - Typed table schemas: `INT`, `TEXT`, `BOOL`
-- In-memory row storage
+- Stable row ids behind table storage
+- In-memory row-store tables
+- Inline constraints: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`
 - `CREATE TABLE`
+- `CREATE INDEX` and `CREATE UNIQUE INDEX`
 - `INSERT INTO ... VALUES`
-- `SELECT ... FROM ... WHERE column = literal`
-- `UPDATE ... SET ... WHERE column = literal`
-- `DELETE FROM ... WHERE column = literal`
+- `SELECT`, projection, `COUNT(*)`, `WHERE`, `ORDER BY`, `LIMIT`
+- Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`
+- `UPDATE ... SET ... WHERE ...`
+- `DELETE FROM ... WHERE ...`
+- `EXPLAIN` for scan vs index lookup
+- `BEGIN`, `COMMIT`, `ROLLBACK` with an in-memory undo log
+- `ANALYZE` placeholder and table statistics module
+- `CHECKPOINT` placeholder for the WAL milestone
 - Strict type checking
 - Basic REPL via `cargo run`
-- Integration tests for the first SQL surface
+- Integration tests for SQL behavior and internals modules
+
+Implemented learning modules:
+
+- Secondary hash indexes
+- Table-level lock manager
+- Slotted page abstraction
+- Educational B+ tree with search, insert, split, and range scan
+- WAL record encoding and decoding
+- Table statistics and equality-cardinality estimates
 
 Example:
 
 ```sql
-CREATE TABLE users (id INT, name TEXT, active BOOL);
-INSERT INTO users VALUES (1, 'Ada Lovelace', true);
-INSERT INTO users VALUES (2, 'Grace Hopper', false);
-SELECT id, name FROM users WHERE active = true;
+CREATE TABLE users (
+  id INT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  active BOOL
+);
+
+CREATE INDEX users_email_idx ON users(email);
+
+INSERT INTO users VALUES (1, 'ada@example.com', 'Ada Lovelace', true);
+INSERT INTO users VALUES (2, 'grace@example.com', 'Grace Hopper', false);
+
+EXPLAIN SELECT id, name FROM users WHERE email = 'ada@example.com';
+SELECT id, name FROM users WHERE active = true ORDER BY id DESC LIMIT 10;
+
+BEGIN;
 UPDATE users SET active = true WHERE id = 2;
-DELETE FROM users WHERE name = 'Ada Lovelace';
+DELETE FROM users WHERE id = 1;
+ROLLBACK;
 ```
 
 ## Quick Start
@@ -71,12 +101,21 @@ src/
   parser.rs       Hand-written SQL tokenizer and parser
   execution.rs    Statement execution and result formatting
   schema.rs       Table schemas, columns, and type validation
-  storage.rs      In-memory row store
+  storage.rs      In-memory row store with row ids and index maintenance
+  index.rs        Secondary hash index
+  transaction.rs  Undo records and transaction state
+  concurrency.rs  Table-level lock manager
+  pager.rs        Slotted page learning module
+  bplus_tree.rs   Educational B+ tree
+  wal.rs          WAL record format
+  optimizer.rs    Statistics and estimates
   row.rs          Row representation
   value.rs        Runtime SQL values
   error.rs        Shared database errors
 tests/
-  basic_sql.rs    End-to-end SQL tests
+  basic_sql.rs    Baseline SQL tests
+  advanced_sql.rs Constraints, indexes, predicates, transactions
+  internals.rs    Locking, pages, B+ tree, WAL, statistics
 docs/
   ARCHITECTURE.md Design notes and trade-offs
   MILESTONES.md   Detailed build milestones
@@ -99,6 +138,21 @@ src/
   txn/            transaction manager, locks, MVCC, WAL
   pager/          disk pages, cache, page ids
 ```
+
+## Roadmap Coverage
+
+The 6-10 week plan is now represented in code. Weeks 1-7 are integrated into the SQL engine. Weeks 8-10 are implemented as tested learning modules rather than a production disk-backed transactional engine.
+
+Still intentionally not claimed as production-complete:
+
+- Durable crash recovery
+- Concurrent SQL sessions
+- MVCC visibility rules
+- Join execution and grouped aggregation
+- Cost-based join ordering
+- Real on-disk table files backed by the B+ tree
+
+Those are the right next deepening steps after this broad pass.
 
 ## Implementation Order
 
@@ -129,4 +183,3 @@ Prefer tests that describe database behavior from SQL first. Then add lower-leve
 This is a teaching database, so clarity wins early. SQLite is the inspiration, but the first versions should not copy SQLite's full machinery. Start with direct AST execution, then introduce planning, cursors, bytecode, pages, and logging only when the simpler design has become educationally limiting.
 
 When a design choice appears, write down what you chose and why. Database systems are trade-off machines.
-

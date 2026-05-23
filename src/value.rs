@@ -17,6 +17,20 @@ impl Value {
             Value::Null => "NULL",
         }
     }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    pub fn compare_same_type(&self, other: &Value) -> Option<std::cmp::Ordering> {
+        match (self, other) {
+            (Value::Int(left), Value::Int(right)) => Some(left.cmp(right)),
+            (Value::Text(left), Value::Text(right)) => Some(left.cmp(right)),
+            (Value::Bool(left), Value::Bool(right)) => Some(left.cmp(right)),
+            (Value::Null, Value::Null) => Some(std::cmp::Ordering::Equal),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Value {

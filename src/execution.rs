@@ -1,14 +1,23 @@
+use std::cmp::Ordering;
+
 use crate::db::Database;
 use crate::error::{DbError, Result};
-use crate::parser::{Assignment, Predicate, Projection, Statement};
+use crate::parser::{
+    Assignment, ComparisonOp, OrderBy, Predicate, Projection, SortDirection, Statement,
+};
 use crate::row::Row;
 use crate::schema::{TableSchema, normalize_identifier};
+use crate::storage::{RowId, Table};
+use crate::transaction::UndoRecord;
 use crate::value::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueryResult {
     TableCreated {
         table: String,
+    },
+    IndexCreated {
+        index: String,
     },
     RowsInserted {
         count: usize,
@@ -23,45 +32,141 @@ pub enum QueryResult {
         columns: Vec<String>,
         rows: Vec<Row>,
     },
+    Plan {
+        plan: String,
+    },
+    TransactionStarted {
+        id: u64,
+    },
+    TransactionCommitted {
+        id: u64,
+    },
+    TransactionRolledBack {
+        id: u64,
+    },
+    Analyzed {
+        tables: Vec<String>,
+    },
+    Checkpoint {
+        message: String,
+    },
 }
 
 impl QueryResult {
     pub fn format_for_display(&self) -> String {
         match self {
             QueryResult::TableCreated { table } => format!("created table {table}"),
+            QueryResult::IndexCreated { index } => format!("created index {index}"),
             QueryResult::RowsInserted { count } => format!("inserted {count} row(s)"),
             QueryResult::RowsUpdated { count } => format!("updated {count} row(s)"),
             QueryResult::RowsDeleted { count } => format!("deleted {count} row(s)"),
             QueryResult::Rows { columns, rows } => format_rows(columns, rows),
+            QueryResult::Plan { plan } => plan.clone(),
+            QueryResult::TransactionStarted { id } => format!("transaction {id} started"),
+            QueryResult::TransactionCommitted { id } => format!("transaction {id} committed"),
+            QueryResult::TransactionRolledBack { id } => {
+                format!("transaction {id} rolled back")
+            }
+            QueryResult::Analyzed { tables } => format!("analyzed {}", tables.join(", ")),
+            QueryResult::Checkpoint { message } => message.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoundPredicate {
+    Comparison {
+        column_index: usize,
+        column_name: String,
+        op: ComparisonOp,
+        value: Value,
+    },
+    And(Box<BoundPredicate>, Box<BoundPredicate>),
+    Or(Box<BoundPredicate>, Box<BoundPredicate>),
 }
 
 pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Result<QueryResult> {
     match statement {
         Statement::CreateTable { name, columns } => {
             let schema = TableSchema::new(name.clone(), columns)?;
+            let table_name = normalize_identifier(&name);
             db.create_table(schema)?;
-            Ok(QueryResult::TableCreated {
-                table: normalize_identifier(&name),
-            })
+            db.record_undo(UndoRecord::CreateTable {
+                table: table_name.clone(),
+            });
+            Ok(QueryResult::TableCreated { table: table_name })
         }
-        Statement::Insert { table, values } => {
-            db.insert(&table, values)?;
-            Ok(QueryResult::RowsInserted { count: 1 })
+        Statement::CreateIndex {
+            name,
+            table,
+            column,
+            unique,
+        } => {
+            let index_name = normalize_identifier(&name);
+            let table_name = normalize_identifier(&table);
+            db.create_index(index_name.clone(), table_name.clone(), column, unique)?;
+            db.record_undo(UndoRecord::CreateIndex {
+                table: table_name,
+                index: index_name.clone(),
+            });
+            Ok(QueryResult::IndexCreated { index: index_name })
         }
+        Statement::Insert { table, values } => insert(db, &table, values),
         Statement::Select {
             table,
             projection,
             predicate,
-        } => select(db, &table, &projection, predicate.as_ref()),
+            order_by,
+            limit,
+        } => select(
+            db,
+            &table,
+            &projection,
+            predicate.as_ref(),
+            order_by.as_ref(),
+            limit,
+        ),
         Statement::Update {
             table,
             assignments,
             predicate,
         } => update(db, &table, &assignments, predicate.as_ref()),
         Statement::Delete { table, predicate } => delete(db, &table, predicate.as_ref()),
+        Statement::Explain(statement) => explain(db, &statement),
+        Statement::Begin => {
+            let id = db.begin()?.0;
+            Ok(QueryResult::TransactionStarted { id })
+        }
+        Statement::Commit => {
+            let id = db.commit()?.0;
+            Ok(QueryResult::TransactionCommitted { id })
+        }
+        Statement::Rollback => {
+            let id = db.rollback()?.0;
+            Ok(QueryResult::TransactionRolledBack { id })
+        }
+        Statement::Analyze { table } => analyze(db, table.as_deref()),
+        Statement::Checkpoint => Ok(QueryResult::Checkpoint {
+            message: "checkpoint requested; durable WAL arrives in the storage milestones".into(),
+        }),
     }
+}
+
+fn insert(db: &mut Database, table_name: &str, row: Row) -> Result<QueryResult> {
+    let table_name = normalize_identifier(table_name);
+    let row_id = {
+        let table = db
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        table.insert(row)?
+    };
+
+    db.record_undo(UndoRecord::Insert {
+        table: table_name,
+        row_id,
+    });
+    Ok(QueryResult::RowsInserted { count: 1 })
 }
 
 fn select(
@@ -69,6 +174,8 @@ fn select(
     table_name: &str,
     projection: &Projection,
     predicate: Option<&Predicate>,
+    order_by: Option<&OrderBy>,
+    limit: Option<usize>,
 ) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
     let table = db
@@ -76,12 +183,43 @@ fn select(
         .get(&table_name)
         .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
     let predicate = resolve_predicate(&table.schema, predicate)?;
-    let (columns, column_indexes) = resolve_projection(&table.schema, projection)?;
+    let mut row_ids = candidate_row_ids(table, predicate.as_ref());
 
-    let rows = table
-        .rows()
-        .iter()
-        .filter(|row| matches_predicate(row, predicate.as_ref()))
+    row_ids.retain(|row_id| {
+        table
+            .row(*row_id)
+            .is_some_and(|row| matches_predicate(row, predicate.as_ref()))
+    });
+
+    if let Some(order_by) = order_by {
+        let order_column = resolve_column(&table.schema, &order_by.column)?;
+        row_ids.sort_by(|left_id, right_id| {
+            let left = &table.row(*left_id).expect("candidate row exists")[order_column];
+            let right = &table.row(*right_id).expect("candidate row exists")[order_column];
+            let ordering = left.compare_same_type(right).unwrap_or(Ordering::Equal);
+
+            match order_by.direction {
+                SortDirection::Asc => ordering,
+                SortDirection::Desc => ordering.reverse(),
+            }
+        });
+    }
+
+    if let Some(limit) = limit {
+        row_ids.truncate(limit);
+    }
+
+    if projection == &Projection::CountAll {
+        return Ok(QueryResult::Rows {
+            columns: vec!["count".into()],
+            rows: vec![vec![Value::Int(row_ids.len() as i64)]],
+        });
+    }
+
+    let (columns, column_indexes) = resolve_projection(&table.schema, projection)?;
+    let rows = row_ids
+        .into_iter()
+        .filter_map(|row_id| table.row(row_id))
         .map(|row| {
             column_indexes
                 .iter()
@@ -100,21 +238,53 @@ fn update(
     predicate: Option<&Predicate>,
 ) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
-    let table = db
-        .tables
-        .get_mut(&table_name)
-        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-    let predicate = resolve_predicate(&table.schema, predicate)?;
-    let assignments = resolve_assignments(&table.schema, assignments)?;
-    let mut updated = 0;
+    let changes = {
+        let table = db
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let predicate = resolve_predicate(&table.schema, predicate)?;
+        let assignments = resolve_assignments(&table.schema, assignments)?;
+        let mut row_ids = candidate_row_ids(table, predicate.as_ref());
 
-    for row in table.rows_mut() {
-        if matches_predicate(row, predicate.as_ref()) {
-            for (index, value) in &assignments {
-                row[*index] = value.clone();
-            }
-            updated += 1;
+        row_ids.retain(|row_id| {
+            table
+                .row(*row_id)
+                .is_some_and(|row| matches_predicate(row, predicate.as_ref()))
+        });
+
+        row_ids
+            .into_iter()
+            .map(|row_id| {
+                let mut new_row = table.row(row_id).expect("candidate row exists").clone();
+                for (index, value) in &assignments {
+                    new_row[*index] = value.clone();
+                }
+                Ok((row_id, new_row))
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let mut undo_records = Vec::new();
+    {
+        let table = db
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+
+        for (row_id, new_row) in changes {
+            let old_row = table.replace_row(row_id, new_row)?;
+            undo_records.push(UndoRecord::Update {
+                table: table_name.clone(),
+                row_id,
+                old_row,
+            });
         }
+    }
+
+    let updated = undo_records.len();
+    for undo in undo_records {
+        db.record_undo(undo);
     }
 
     Ok(QueryResult::RowsUpdated { count: updated })
@@ -126,14 +296,190 @@ fn delete(
     predicate: Option<&Predicate>,
 ) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
-    let table = db
-        .tables
-        .get_mut(&table_name)
-        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-    let predicate = resolve_predicate(&table.schema, predicate)?;
-    let deleted = table.delete_where(|row| matches_predicate(row, predicate.as_ref()));
+    let row_ids = {
+        let table = db
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let predicate = resolve_predicate(&table.schema, predicate)?;
+        let mut row_ids = candidate_row_ids(table, predicate.as_ref());
+
+        row_ids.retain(|row_id| {
+            table
+                .row(*row_id)
+                .is_some_and(|row| matches_predicate(row, predicate.as_ref()))
+        });
+        row_ids
+    };
+
+    let mut undo_records = Vec::new();
+    {
+        let table = db
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+
+        for row_id in row_ids {
+            let stored = table.delete_row(row_id)?;
+            undo_records.push(UndoRecord::Delete {
+                table: table_name.clone(),
+                stored,
+            });
+        }
+    }
+
+    let deleted = undo_records.len();
+    for undo in undo_records {
+        db.record_undo(undo);
+    }
 
     Ok(QueryResult::RowsDeleted { count: deleted })
+}
+
+fn analyze(db: &Database, table: Option<&str>) -> Result<QueryResult> {
+    let tables = if let Some(table) = table {
+        let table = normalize_identifier(table);
+        if !db.tables.contains_key(&table) {
+            return Err(DbError::TableNotFound(table));
+        }
+        vec![table]
+    } else {
+        let mut tables = db.tables.keys().cloned().collect::<Vec<_>>();
+        tables.sort();
+        tables
+    };
+
+    Ok(QueryResult::Analyzed { tables })
+}
+
+fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
+    let plan = match statement {
+        Statement::Select {
+            table,
+            projection,
+            predicate,
+            order_by,
+            limit,
+        } => explain_select(
+            db,
+            table,
+            projection,
+            predicate.as_ref(),
+            order_by.as_ref(),
+            *limit,
+        )?,
+        Statement::Insert { table, .. } => {
+            format!("Insert\n  Table: {}", normalize_identifier(table))
+        }
+        Statement::Update {
+            table, predicate, ..
+        } => {
+            let table_name = normalize_identifier(table);
+            let table_ref = db
+                .tables
+                .get(&table_name)
+                .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            let predicate = resolve_predicate(&table_ref.schema, predicate.as_ref())?;
+            format!(
+                "Update\n  Table: {table_name}\n  Access: {}",
+                describe_access_path(table_ref, predicate.as_ref())
+            )
+        }
+        Statement::Delete { table, predicate } => {
+            let table_name = normalize_identifier(table);
+            let table_ref = db
+                .tables
+                .get(&table_name)
+                .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            let predicate = resolve_predicate(&table_ref.schema, predicate.as_ref())?;
+            format!(
+                "Delete\n  Table: {table_name}\n  Access: {}",
+                describe_access_path(table_ref, predicate.as_ref())
+            )
+        }
+        other => format!("{other:?}"),
+    };
+
+    Ok(QueryResult::Plan { plan })
+}
+
+fn explain_select(
+    db: &Database,
+    table: &str,
+    projection: &Projection,
+    predicate: Option<&Predicate>,
+    order_by: Option<&OrderBy>,
+    limit: Option<usize>,
+) -> Result<String> {
+    let table_name = normalize_identifier(table);
+    let table = db
+        .tables
+        .get(&table_name)
+        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+    let predicate = resolve_predicate(&table.schema, predicate)?;
+    let projection = match projection {
+        Projection::All => "*".into(),
+        Projection::Columns(columns) => columns.join(", "),
+        Projection::CountAll => "COUNT(*)".into(),
+    };
+    let mut lines = vec![
+        "Select".to_string(),
+        format!("  Table: {table_name}"),
+        format!("  Projection: {projection}"),
+        format!(
+            "  Access: {}",
+            describe_access_path(table, predicate.as_ref())
+        ),
+    ];
+
+    if let Some(order_by) = order_by {
+        lines.push(format!(
+            "  Sort: {} {:?}",
+            normalize_identifier(&order_by.column),
+            order_by.direction
+        ));
+    }
+
+    if let Some(limit) = limit {
+        lines.push(format!("  Limit: {limit}"));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn describe_access_path(table: &Table, predicate: Option<&BoundPredicate>) -> String {
+    if let Some((column_index, value)) = index_probe(predicate)
+        && let Some(index) = table.index_on_column(column_index)
+    {
+        return format!(
+            "IndexLookup(index={}, column={}, key={})",
+            index.name, index.column, value
+        );
+    }
+
+    "SeqScan".into()
+}
+
+fn candidate_row_ids(table: &Table, predicate: Option<&BoundPredicate>) -> Vec<RowId> {
+    if let Some((column_index, value)) = index_probe(predicate)
+        && let Some(index) = table.index_on_column(column_index)
+    {
+        return index.probe(&value);
+    }
+
+    table.row_ids()
+}
+
+fn index_probe(predicate: Option<&BoundPredicate>) -> Option<(usize, Value)> {
+    match predicate {
+        Some(BoundPredicate::Comparison {
+            column_index,
+            op: ComparisonOp::Eq,
+            value,
+            ..
+        }) => Some((*column_index, value.clone())),
+        _ => None,
+    }
 }
 
 fn resolve_projection(
@@ -151,15 +497,14 @@ fn resolve_projection(
 
             for column in columns {
                 let column = normalize_identifier(column);
-                let index = schema
-                    .column_index(&column)
-                    .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
+                let index = resolve_column(schema, &column)?;
                 names.push(column);
                 indexes.push(index);
             }
 
             Ok((names, indexes))
         }
+        Projection::CountAll => Ok((vec!["count".into()], Vec::new())),
     }
 }
 
@@ -171,9 +516,7 @@ fn resolve_assignments(
 
     for assignment in assignments {
         let column = normalize_identifier(&assignment.column);
-        let index = schema
-            .column_index(&column)
-            .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
+        let index = resolve_column(schema, &column)?;
         schema.validate_value(index, &assignment.value)?;
         resolved.push((index, assignment.value.clone()));
     }
@@ -184,24 +527,79 @@ fn resolve_assignments(
 fn resolve_predicate(
     schema: &TableSchema,
     predicate: Option<&Predicate>,
-) -> Result<Option<(usize, Value)>> {
+) -> Result<Option<BoundPredicate>> {
     let Some(predicate) = predicate else {
         return Ok(None);
     };
 
-    let column = normalize_identifier(&predicate.column);
-    let index = schema
-        .column_index(&column)
-        .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
-    schema.validate_value(index, &predicate.value)?;
-
-    Ok(Some((index, predicate.value.clone())))
+    resolve_predicate_inner(schema, predicate).map(Some)
 }
 
-fn matches_predicate(row: &Row, predicate: Option<&(usize, Value)>) -> bool {
+fn resolve_predicate_inner(schema: &TableSchema, predicate: &Predicate) -> Result<BoundPredicate> {
     match predicate {
-        Some((index, value)) => &row[*index] == value,
+        Predicate::Comparison { column, op, value } => {
+            let column = normalize_identifier(column);
+            let index = resolve_column(schema, &column)?;
+            schema.validate_value(index, value)?;
+            Ok(BoundPredicate::Comparison {
+                column_index: index,
+                column_name: column,
+                op: *op,
+                value: value.clone(),
+            })
+        }
+        Predicate::And(left, right) => Ok(BoundPredicate::And(
+            Box::new(resolve_predicate_inner(schema, left)?),
+            Box::new(resolve_predicate_inner(schema, right)?),
+        )),
+        Predicate::Or(left, right) => Ok(BoundPredicate::Or(
+            Box::new(resolve_predicate_inner(schema, left)?),
+            Box::new(resolve_predicate_inner(schema, right)?),
+        )),
+    }
+}
+
+fn resolve_column(schema: &TableSchema, column: &str) -> Result<usize> {
+    let column = normalize_identifier(column);
+    schema
+        .column_index(&column)
+        .ok_or(DbError::ColumnNotFound(column))
+}
+
+fn matches_predicate(row: &Row, predicate: Option<&BoundPredicate>) -> bool {
+    match predicate {
+        Some(BoundPredicate::Comparison {
+            column_index,
+            op,
+            value,
+            ..
+        }) => compare_values(&row[*column_index], *op, value),
+        Some(BoundPredicate::And(left, right)) => {
+            matches_predicate(row, Some(left)) && matches_predicate(row, Some(right))
+        }
+        Some(BoundPredicate::Or(left, right)) => {
+            matches_predicate(row, Some(left)) || matches_predicate(row, Some(right))
+        }
         None => true,
+    }
+}
+
+fn compare_values(left: &Value, op: ComparisonOp, right: &Value) -> bool {
+    match op {
+        ComparisonOp::Eq => left == right,
+        ComparisonOp::Ne => left != right,
+        ComparisonOp::Lt => left
+            .compare_same_type(right)
+            .is_some_and(|ordering| ordering == Ordering::Less),
+        ComparisonOp::Lte => left
+            .compare_same_type(right)
+            .is_some_and(|ordering| matches!(ordering, Ordering::Less | Ordering::Equal)),
+        ComparisonOp::Gt => left
+            .compare_same_type(right)
+            .is_some_and(|ordering| ordering == Ordering::Greater),
+        ComparisonOp::Gte => left
+            .compare_same_type(right)
+            .is_some_and(|ordering| matches!(ordering, Ordering::Greater | Ordering::Equal)),
     }
 }
 
