@@ -67,6 +67,12 @@ fn wal_records_round_trip_through_text_encoding() {
         WalRecord::decode("COMMIT|42").unwrap(),
         WalRecord::Commit { tx: 42 }
     );
+    assert_eq!(
+        WalRecord::decode("SQL|INSERT INTO users VALUES (1, 'ada');").unwrap(),
+        WalRecord::Statement {
+            sql: "INSERT INTO users VALUES (1, 'ada');".into(),
+        }
+    );
 }
 
 #[test]

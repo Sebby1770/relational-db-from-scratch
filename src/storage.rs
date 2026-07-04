@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::codec::IndexDefinition;
 use crate::error::{DbError, Result};
 use crate::index::SecondaryIndex;
 use crate::row::Row;
@@ -165,6 +166,30 @@ impl Table {
         let mut names = self.indexes.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    pub fn index_definitions(&self) -> Vec<IndexDefinition> {
+        let mut definitions = self
+            .indexes
+            .values()
+            .map(|index| IndexDefinition {
+                name: index.name.clone(),
+                column: index.column.clone(),
+                unique: index.unique,
+            })
+            .collect::<Vec<_>>();
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        definitions
+    }
+
+    pub fn persisted_rows(&self) -> Vec<(RowId, Row)> {
+        let mut rows = self
+            .rows
+            .iter()
+            .map(|(row_id, row)| (*row_id, row.clone()))
+            .collect::<Vec<_>>();
+        rows.sort_by_key(|(row_id, _)| *row_id);
+        rows
     }
 
     fn sorted_row_ids(&self) -> Vec<RowId> {

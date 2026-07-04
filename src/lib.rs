@@ -1,4 +1,5 @@
 pub mod bplus_tree;
+pub mod codec;
 pub mod concurrency;
 pub mod db;
 pub mod error;
@@ -7,6 +8,7 @@ pub mod index;
 pub mod optimizer;
 pub mod pager;
 pub mod parser;
+pub mod persistence;
 pub mod row;
 pub mod schema;
 pub mod storage;

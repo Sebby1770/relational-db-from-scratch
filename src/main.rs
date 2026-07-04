@@ -1,12 +1,22 @@
+use std::env;
 use std::io::{self, Write};
 
 use relational_db_from_scratch::Database;
 
 fn main() -> io::Result<()> {
-    let mut db = Database::new();
+    let mut db = match env::args().nth(1) {
+        Some(path) => Database::open(path)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?,
+        None => Database::new(),
+    };
     let stdin = io::stdin();
 
     println!("relational-db-from-scratch");
+    if let Some(directory) = db.data_directory() {
+        println!("Persistent storage: {}", directory.display());
+    } else {
+        println!("In-memory mode. Pass a data directory to enable WAL + snapshots.");
+    }
     println!("Type SQL statements or .help for meta commands.");
 
     loop {
@@ -55,6 +65,8 @@ fn handle_meta_command(db: &Database, input: &str) -> Option<String> {
                 "  .schema <table>    show table schema and indexes",
                 "  .help              show this help",
                 "  .quit / .exit      leave the REPL",
+                "",
+                "Launch with a data directory to enable WAL logging and CHECKPOINT snapshots.",
             ]
             .join("\n"),
         ),

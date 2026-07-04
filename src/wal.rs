@@ -16,6 +16,9 @@ pub enum WalRecord {
     Rollback {
         tx: u64,
     },
+    Statement {
+        sql: String,
+    },
     Checkpoint,
 }
 
@@ -28,6 +31,7 @@ impl WalRecord {
             }
             WalRecord::Commit { tx } => format!("COMMIT|{tx}"),
             WalRecord::Rollback { tx } => format!("ROLLBACK|{tx}"),
+            WalRecord::Statement { sql } => format!("SQL|{}", encode_sql(sql)),
             WalRecord::Checkpoint => "CHECKPOINT".into(),
         }
     }
@@ -44,6 +48,9 @@ impl WalRecord {
             }),
             ["COMMIT", tx] => Ok(WalRecord::Commit { tx: parse_u64(tx)? }),
             ["ROLLBACK", tx] => Ok(WalRecord::Rollback { tx: parse_u64(tx)? }),
+            ["SQL", sql] => Ok(WalRecord::Statement {
+                sql: decode_sql(sql)?,
+            }),
             ["CHECKPOINT"] => Ok(WalRecord::Checkpoint),
             _ => Err(DbError::Storage(format!("invalid WAL record: {input}"))),
         }
@@ -58,6 +65,31 @@ fn parse_u64(input: &str) -> Result<u64> {
 
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn encode_sql(sql: &str) -> String {
+    sql.replace('\\', "\\\\").replace('|', "\\p")
+}
+
+fn decode_sql(input: &str) -> Result<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => output.push('\\'),
+                Some('p') => output.push('|'),
+                Some(other) => {
+                    output.push('\\');
+                    output.push(other);
+                }
+                None => output.push('\\'),
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+    Ok(output)
 }
 
 fn decode_hex(input: &str) -> Result<Vec<u8>> {

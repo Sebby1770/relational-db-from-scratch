@@ -149,9 +149,10 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
             Ok(QueryResult::TransactionRolledBack { id })
         }
         Statement::Analyze { table } => analyze(db, table.as_deref()),
-        Statement::Checkpoint => Ok(QueryResult::Checkpoint {
-            message: "checkpoint requested; durable WAL arrives in the storage milestones".into(),
-        }),
+        Statement::Checkpoint => {
+            let message = db.checkpoint()?;
+            Ok(QueryResult::Checkpoint { message })
+        }
     }
 }
 

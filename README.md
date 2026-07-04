@@ -29,6 +29,9 @@ Implemented SQL-facing features:
 - O(1) row lookup via hash-backed table storage
 - Strict type checking
 - REPL meta commands: `.tables`, `.schema`, `.help`
+- Persistent storage with snapshot files + append-only WAL replay
+- `Database::open(path)` and `cargo run -- <data-dir>` for durable sessions
+- `CHECKPOINT` writes a snapshot and truncates the WAL
 - GitHub Actions CI (`fmt`, `clippy`, `cargo test`)
 - Integration tests for SQL behavior and internals modules
 
@@ -70,6 +73,13 @@ ROLLBACK;
 ```bash
 cargo test
 cargo run
+```
+
+Persistent mode with snapshot + WAL replay:
+
+```bash
+mkdir -p data
+cargo run -- data
 ```
 
 Inside the REPL:

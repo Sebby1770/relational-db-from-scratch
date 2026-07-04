@@ -56,3 +56,9 @@ impl fmt::Display for DbError {
 }
 
 impl std::error::Error for DbError {}
+
+impl From<std::io::Error> for DbError {
+    fn from(error: std::io::Error) -> Self {
+        DbError::Storage(error.to_string())
+    }
+}

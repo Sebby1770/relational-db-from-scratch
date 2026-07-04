@@ -1,22 +1,38 @@
 use std::collections::HashMap;
+use std::path::Path;
 
 use crate::concurrency::{LockManager, LockMode};
 use crate::error::{DbError, Result};
 use crate::execution::{QueryResult, execute_statement};
 use crate::optimizer::TableStats;
 use crate::parser::parse_sql;
+use crate::persistence::Persistence;
 use crate::row::Row;
 use crate::schema::{TableSchema, normalize_identifier};
 use crate::storage::Table;
 use crate::transaction::{Transaction, TransactionId, UndoRecord};
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Database {
     pub(crate) tables: HashMap<String, Table>,
     pub(crate) stats: HashMap<String, TableStats>,
     pub(crate) lock_manager: LockManager,
     pub(crate) active_transaction: Option<Transaction>,
+    persistence: Option<Persistence>,
     next_transaction_id: u64,
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            tables: HashMap::new(),
+            stats: HashMap::new(),
+            lock_manager: LockManager::new(),
+            active_transaction: None,
+            persistence: None,
+            next_transaction_id: 0,
+        }
+    }
 }
 
 impl Database {
@@ -24,9 +40,44 @@ impl Database {
         Self::default()
     }
 
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        Persistence::open(directory)?.load_or_empty()
+    }
+
+    pub fn data_directory(&self) -> Option<&Path> {
+        self.persistence.as_ref().map(Persistence::directory)
+    }
+
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = parse_sql(sql)?;
+        let result = execute_statement(self, statement)?;
+        if Self::should_log_sql(sql) {
+            if let Some(persistence) = &self.persistence {
+                persistence.append_sql(sql)?;
+            }
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn execute_internal(&mut self, sql: &str) -> Result<QueryResult> {
+        let statement = parse_sql(sql)?;
         execute_statement(self, statement)
+    }
+
+    pub(crate) fn attach_persistence(&mut self, persistence: Persistence) {
+        self.persistence = Some(persistence);
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<String> {
+        if let Some(persistence) = &self.persistence {
+            persistence.checkpoint(self)?;
+            Ok(format!(
+                "checkpoint complete at {}",
+                persistence.directory().display()
+            ))
+        } else {
+            Ok("checkpoint requested; open the database with a data directory first".into())
+        }
     }
 
     pub fn table_names(&self) -> Vec<String> {
@@ -75,6 +126,10 @@ impl Database {
 
         if let Some(stats) = self.stats.get(&table_name) {
             lines.push(format!("rows: {}", stats.row_count));
+        }
+
+        if let Some(directory) = self.data_directory() {
+            lines.push(format!("storage: {}", directory.display()));
         }
 
         Ok(lines.join("\n"))
@@ -180,6 +235,14 @@ impl Database {
         self.active_transaction
             .as_ref()
             .map(|transaction| transaction.id)
+    }
+
+    fn should_log_sql(sql: &str) -> bool {
+        let trimmed = sql.trim().to_ascii_uppercase();
+        !(trimmed.starts_with("SELECT")
+            || trimmed.starts_with("EXPLAIN")
+            || trimmed.starts_with("ANALYZE")
+            || trimmed.starts_with("CHECKPOINT"))
     }
 
     fn apply_undo(&mut self, undo: UndoRecord) -> Result<()> {
