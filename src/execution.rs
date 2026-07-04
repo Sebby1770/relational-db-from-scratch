@@ -20,6 +20,12 @@ pub enum QueryResult {
     IndexCreated {
         index: String,
     },
+    TableDropped {
+        table: String,
+    },
+    IndexDropped {
+        index: String,
+    },
     RowsInserted {
         count: usize,
     },
@@ -58,6 +64,8 @@ impl QueryResult {
         match self {
             QueryResult::TableCreated { table } => format!("created table {table}"),
             QueryResult::IndexCreated { index } => format!("created index {index}"),
+            QueryResult::TableDropped { table } => format!("dropped table {table}"),
+            QueryResult::IndexDropped { index } => format!("dropped index {index}"),
             QueryResult::RowsInserted { count } => format!("inserted {count} row(s)"),
             QueryResult::RowsUpdated { count } => format!("updated {count} row(s)"),
             QueryResult::RowsDeleted { count } => format!("deleted {count} row(s)"),
@@ -97,6 +105,19 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
                 table: table_name.clone(),
             });
             Ok(QueryResult::TableCreated { table: table_name })
+        }
+        Statement::DropTable { name } => {
+            let table_name = normalize_identifier(&name);
+            db.acquire_write_lock(&table_name)?;
+            db.drop_table(&table_name)?;
+            Ok(QueryResult::TableDropped { table: table_name })
+        }
+        Statement::DropIndex { name } => {
+            let index_name = normalize_identifier(&name);
+            let table_name = db.table_for_index(&index_name)?;
+            db.acquire_write_lock(&table_name)?;
+            let (_, index_name) = db.drop_index(&index_name)?;
+            Ok(QueryResult::IndexDropped { index: index_name })
         }
         Statement::CreateIndex {
             name,

@@ -162,6 +162,36 @@ impl Database {
         table.create_index(index_name, column, unique)
     }
 
+    pub fn drop_table(&mut self, table_name: &str) -> Result<()> {
+        let table_name = normalize_identifier(table_name);
+        self.tables
+            .remove(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        self.stats.remove(&table_name);
+        Ok(())
+    }
+
+    pub fn table_for_index(&self, index_name: &str) -> Result<String> {
+        let index_name = normalize_identifier(index_name);
+        for (table_name, table) in &self.tables {
+            if table.index(&index_name).is_some() {
+                return Ok(table_name.clone());
+            }
+        }
+
+        Err(DbError::IndexNotFound(index_name))
+    }
+
+    pub fn drop_index(&mut self, index_name: &str) -> Result<(String, String)> {
+        let index_name = normalize_identifier(index_name);
+        let table_name = self.table_for_index(&index_name)?;
+        self.tables
+            .get_mut(&table_name)
+            .expect("table exists")
+            .drop_index(&index_name)?;
+        Ok((table_name, index_name))
+    }
+
     pub fn insert(&mut self, table_name: &str, row: Row) -> Result<()> {
         let table_name = normalize_identifier(table_name);
         let table = self

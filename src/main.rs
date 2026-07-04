@@ -39,13 +39,28 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        if let Some(output) = handle_meta_command(&db, trimmed) {
+        if trimmed.eq_ignore_ascii_case(".checkpoint") {
+            match db.execute("CHECKPOINT;") {
+                Ok(result) => println!("{}", result.format_for_display()),
+                Err(error) => eprintln!("error: {error}"),
+            }
+            continue;
+        }
+
+        if let Some(output) = handle_meta_command(&mut db, trimmed) {
             println!("{output}");
             continue;
         }
 
+        let started = std::time::Instant::now();
         match db.execute(trimmed) {
-            Ok(result) => println!("{}", result.format_for_display()),
+            Ok(result) => {
+                println!("{}", result.format_for_display());
+                let elapsed = started.elapsed();
+                if elapsed.as_millis() > 0 {
+                    eprintln!("({} ms)", elapsed.as_millis());
+                }
+            }
             Err(error) => eprintln!("error: {error}"),
         }
     }
@@ -53,7 +68,17 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_meta_command(db: &Database, input: &str) -> Option<String> {
+fn describe_storage(db: &Database) -> String {
+    match db.data_directory() {
+        Some(path) => format!(
+            "storage directory: {}\nrun .checkpoint to flush database.snapshot and truncate wal.log",
+            path.display()
+        ),
+        None => "in-memory mode (no persistence directory configured)".into(),
+    }
+}
+
+fn handle_meta_command(db: &mut Database, input: &str) -> Option<String> {
     let mut parts = input.split_whitespace();
     let command = parts.next()?;
 
@@ -63,6 +88,8 @@ fn handle_meta_command(db: &Database, input: &str) -> Option<String> {
                 "Meta commands:",
                 "  .tables            list tables",
                 "  .schema <table>    show table schema and indexes",
+                "  .storage           show persistence directory status",
+                "  .checkpoint        flush snapshot + truncate WAL",
                 "  .help              show this help",
                 "  .quit / .exit      leave the REPL",
                 "",
@@ -70,6 +97,7 @@ fn handle_meta_command(db: &Database, input: &str) -> Option<String> {
             ]
             .join("\n"),
         ),
+        ".storage" => Some(describe_storage(db)),
         ".tables" => {
             let tables = db.table_names();
             if tables.is_empty() {

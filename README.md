@@ -1,6 +1,8 @@
 # Relational Database From Scratch
 
-An educational, SQLite-inspired relational database built in Rust. The project starts as a small in-memory row store and grows toward indexing, query planning, disk pages, transactions, concurrency control, and recovery.
+An educational, SQLite-inspired relational database built in Rust.
+
+See [CHANGELOG.md](CHANGELOG.md) for release history. The project starts as a small in-memory row store and grows toward indexing, query planning, disk pages, transactions, concurrency control, and recovery.
 
 This repository is intentionally designed for learning database internals properly. The code avoids magic: the parser is hand-written, the in-memory storage engine is inspectable, and the advanced internals are split into small modules with tests.
 

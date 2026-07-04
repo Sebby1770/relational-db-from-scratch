@@ -14,6 +14,12 @@ pub enum Statement {
         column: String,
         unique: bool,
     },
+    DropTable {
+        name: String,
+    },
+    DropIndex {
+        name: String,
+    },
     Insert {
         table: String,
         values: Vec<Value>,
@@ -295,6 +301,10 @@ impl Parser {
             return Ok(Statement::Checkpoint);
         }
 
+        if self.consume_keyword("DROP") {
+            return self.parse_drop();
+        }
+
         if self.consume_keyword("CREATE") {
             return self.parse_create();
         }
@@ -316,6 +326,22 @@ impl Parser {
         }
 
         Err(DbError::Parse("expected SQL statement".into()))
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        if self.consume_keyword("TABLE") {
+            return Ok(Statement::DropTable {
+                name: self.expect_ident()?,
+            });
+        }
+
+        if self.consume_keyword("INDEX") {
+            return Ok(Statement::DropIndex {
+                name: self.expect_ident()?,
+            });
+        }
+
+        Err(DbError::Parse("expected TABLE or INDEX after DROP".into()))
     }
 
     fn parse_create(&mut self) -> Result<Statement> {
