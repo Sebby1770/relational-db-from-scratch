@@ -21,10 +21,15 @@ Implemented SQL-facing features:
 - `DELETE FROM ... WHERE ...`
 - `EXPLAIN` for scan vs index lookup
 - `BEGIN`, `COMMIT`, `ROLLBACK` with an in-memory undo log
-- `ANALYZE` placeholder and table statistics module
+- `ANALYZE` collects per-table statistics used by `EXPLAIN`
 - `CHECKPOINT` placeholder for the WAL milestone
+- SQL-correct `NULL` handling in `WHERE` predicates (unknown comparisons filter out)
+- Compound `AND` predicates can use equality indexes
+- Table-level lock manager integrated with active transactions
+- O(1) row lookup via hash-backed table storage
 - Strict type checking
-- Basic REPL via `cargo run`
+- REPL meta commands: `.tables`, `.schema`, `.help`
+- GitHub Actions CI (`fmt`, `clippy`, `cargo test`)
 - Integration tests for SQL behavior and internals modules
 
 Implemented learning modules:

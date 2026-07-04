@@ -17,7 +17,7 @@ pub struct StoredRow {
 pub struct Table {
     pub schema: TableSchema,
     next_row_id: RowId,
-    rows: Vec<StoredRow>,
+    rows: HashMap<RowId, Row>,
     indexes: HashMap<String, SecondaryIndex>,
 }
 
@@ -26,7 +26,7 @@ impl Table {
         Self {
             schema,
             next_row_id: 1,
-            rows: Vec::new(),
+            rows: HashMap::new(),
             indexes: HashMap::new(),
         }
     }
@@ -50,38 +50,42 @@ impl Table {
             self.next_row_id = row_id + 1;
         }
 
-        self.rows.push(StoredRow { row_id, row });
-        self.rows.sort_by_key(|stored| stored.row_id);
+        self.rows.insert(row_id, row);
         Ok(())
     }
 
     pub fn rows(&self) -> impl Iterator<Item = &Row> {
-        self.rows.iter().map(|stored| &stored.row)
+        self.sorted_row_ids()
+            .into_iter()
+            .map(|row_id| self.rows.get(&row_id).expect("sorted row id exists"))
     }
 
-    pub fn stored_rows(&self) -> impl Iterator<Item = &StoredRow> {
-        self.rows.iter()
+    pub fn stored_rows(&self) -> impl Iterator<Item = StoredRow> + '_ {
+        self.sorted_row_ids().into_iter().map(|row_id| StoredRow {
+            row_id,
+            row: self
+                .rows
+                .get(&row_id)
+                .expect("sorted row id exists")
+                .clone(),
+        })
     }
 
     pub fn row(&self, row_id: RowId) -> Option<&Row> {
-        self.rows
-            .iter()
-            .find(|stored| stored.row_id == row_id)
-            .map(|stored| &stored.row)
+        self.rows.get(&row_id)
     }
 
     pub fn row_ids(&self) -> Vec<RowId> {
-        self.rows.iter().map(|stored| stored.row_id).collect()
+        self.sorted_row_ids()
     }
 
     pub fn replace_row(&mut self, row_id: RowId, new_row: Row) -> Result<Row> {
         self.validate_row_for_write(&new_row, Some(row_id))?;
-        let row_position = self
+        let old_row = self
             .rows
-            .iter()
-            .position(|stored| stored.row_id == row_id)
-            .ok_or_else(|| DbError::InvalidStatement(format!("row id {row_id} not found")))?;
-        let old_row = self.rows[row_position].row.clone();
+            .get(&row_id)
+            .ok_or_else(|| DbError::InvalidStatement(format!("row id {row_id} not found")))?
+            .clone();
 
         for index in self.indexes.values_mut() {
             index.update(
@@ -91,23 +95,21 @@ impl Table {
             )?;
         }
 
-        self.rows[row_position].row = new_row;
+        self.rows.insert(row_id, new_row);
         Ok(old_row)
     }
 
     pub fn delete_row(&mut self, row_id: RowId) -> Result<StoredRow> {
-        let row_position = self
+        let row = self
             .rows
-            .iter()
-            .position(|stored| stored.row_id == row_id)
+            .remove(&row_id)
             .ok_or_else(|| DbError::InvalidStatement(format!("row id {row_id} not found")))?;
-        let stored = self.rows.remove(row_position);
 
         for index in self.indexes.values_mut() {
-            index.remove(&stored.row[index.column_index], row_id);
+            index.remove(&row[index.column_index], row_id);
         }
 
-        Ok(stored)
+        Ok(StoredRow { row_id, row })
     }
 
     pub fn create_index(
@@ -129,8 +131,8 @@ impl Table {
             .ok_or_else(|| DbError::ColumnNotFound(column.clone()))?;
         let mut index = SecondaryIndex::new(name.clone(), column, column_index, unique);
 
-        for stored in &self.rows {
-            index.insert(&stored.row[column_index], stored.row_id)?;
+        for (row_id, row) in &self.rows {
+            index.insert(&row[column_index], *row_id)?;
         }
 
         self.indexes.insert(name, index);
@@ -146,9 +148,13 @@ impl Table {
     }
 
     pub fn index_on_column(&self, column_index: usize) -> Option<&SecondaryIndex> {
-        self.indexes
+        let mut matches = self
+            .indexes
             .values()
-            .find(|index| index.column_index == column_index)
+            .filter(|index| index.column_index == column_index)
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.name.cmp(&right.name));
+        matches.first().copied()
     }
 
     pub fn index(&self, name: &str) -> Option<&SecondaryIndex> {
@@ -159,6 +165,12 @@ impl Table {
         let mut names = self.indexes.keys().cloned().collect::<Vec<_>>();
         names.sort();
         names
+    }
+
+    fn sorted_row_ids(&self) -> Vec<RowId> {
+        let mut ids = self.rows.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids
     }
 
     fn validate_row_for_write(&self, row: &Row, replacing_row_id: Option<RowId>) -> Result<()> {
@@ -172,8 +184,8 @@ impl Table {
             }
 
             let column_name = &self.schema.columns[column_index].name;
-            let duplicate = self.rows.iter().any(|stored| {
-                Some(stored.row_id) != replacing_row_id && stored.row[column_index] == *value
+            let duplicate = self.rows.iter().any(|(row_id, stored)| {
+                Some(*row_id) != replacing_row_id && stored[column_index] == *value
             });
 
             if duplicate {
@@ -193,8 +205,8 @@ impl Table {
                 continue;
             }
 
-            let duplicate = self.rows.iter().any(|stored| {
-                Some(stored.row_id) != replacing_row_id && stored.row[index.column_index] == *value
+            let duplicate = self.rows.iter().any(|(row_id, stored)| {
+                Some(*row_id) != replacing_row_id && stored[index.column_index] == *value
             });
 
             if duplicate {

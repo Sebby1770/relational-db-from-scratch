@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 
 use crate::db::Database;
 use crate::error::{DbError, Result};
+use crate::optimizer::TableStats;
 use crate::parser::{
     Assignment, ComparisonOp, OrderBy, Predicate, Projection, SortDirection, Statement,
 };
@@ -90,6 +91,7 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
         Statement::CreateTable { name, columns } => {
             let schema = TableSchema::new(name.clone(), columns)?;
             let table_name = normalize_identifier(&name);
+            db.acquire_write_lock(&table_name)?;
             db.create_table(schema)?;
             db.record_undo(UndoRecord::CreateTable {
                 table: table_name.clone(),
@@ -104,6 +106,7 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
         } => {
             let index_name = normalize_identifier(&name);
             let table_name = normalize_identifier(&table);
+            db.acquire_write_lock(&table_name)?;
             db.create_index(index_name.clone(), table_name.clone(), column, unique)?;
             db.record_undo(UndoRecord::CreateIndex {
                 table: table_name,
@@ -154,6 +157,7 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
 
 fn insert(db: &mut Database, table_name: &str, row: Row) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
+    db.acquire_write_lock(&table_name)?;
     let row_id = {
         let table = db
             .tables
@@ -170,7 +174,7 @@ fn insert(db: &mut Database, table_name: &str, row: Row) -> Result<QueryResult> 
 }
 
 fn select(
-    db: &Database,
+    db: &mut Database,
     table_name: &str,
     projection: &Projection,
     predicate: Option<&Predicate>,
@@ -178,6 +182,7 @@ fn select(
     limit: Option<usize>,
 ) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
+    db.acquire_read_lock(&table_name)?;
     let table = db
         .tables
         .get(&table_name)
@@ -238,6 +243,7 @@ fn update(
     predicate: Option<&Predicate>,
 ) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
+    db.acquire_write_lock(&table_name)?;
     let changes = {
         let table = db
             .tables
@@ -296,6 +302,7 @@ fn delete(
     predicate: Option<&Predicate>,
 ) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
+    db.acquire_write_lock(&table_name)?;
     let row_ids = {
         let table = db
             .tables
@@ -336,8 +343,8 @@ fn delete(
     Ok(QueryResult::RowsDeleted { count: deleted })
 }
 
-fn analyze(db: &Database, table: Option<&str>) -> Result<QueryResult> {
-    let tables = if let Some(table) = table {
+fn analyze(db: &mut Database, table: Option<&str>) -> Result<QueryResult> {
+    let table_names = if let Some(table) = table {
         let table = normalize_identifier(table);
         if !db.tables.contains_key(&table) {
             return Err(DbError::TableNotFound(table));
@@ -349,7 +356,24 @@ fn analyze(db: &Database, table: Option<&str>) -> Result<QueryResult> {
         tables
     };
 
-    Ok(QueryResult::Analyzed { tables })
+    let mut summaries = Vec::new();
+    for table_name in table_names {
+        let table = db
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let stats = TableStats::from_rows(&table.schema, table.rows().cloned());
+        let summary = format!(
+            "{} ({} rows, {} indexed columns)",
+            table_name,
+            stats.row_count,
+            stats.distinct_values.len()
+        );
+        db.stats.insert(table_name, stats);
+        summaries.push(summary);
+    }
+
+    Ok(QueryResult::Analyzed { tables: summaries })
 }
 
 fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
@@ -382,7 +406,7 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
             let predicate = resolve_predicate(&table_ref.schema, predicate.as_ref())?;
             format!(
                 "Update\n  Table: {table_name}\n  Access: {}",
-                describe_access_path(table_ref, predicate.as_ref())
+                describe_access_path(table_ref, predicate.as_ref(), db.stats.get(&table_name),)
             )
         }
         Statement::Delete { table, predicate } => {
@@ -394,7 +418,7 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
             let predicate = resolve_predicate(&table_ref.schema, predicate.as_ref())?;
             format!(
                 "Delete\n  Table: {table_name}\n  Access: {}",
-                describe_access_path(table_ref, predicate.as_ref())
+                describe_access_path(table_ref, predicate.as_ref(), db.stats.get(&table_name),)
             )
         }
         other => format!("{other:?}"),
@@ -428,7 +452,7 @@ fn explain_select(
         format!("  Projection: {projection}"),
         format!(
             "  Access: {}",
-            describe_access_path(table, predicate.as_ref())
+            describe_access_path(table, predicate.as_ref(), db.stats.get(&table_name))
         ),
     ];
 
@@ -447,14 +471,27 @@ fn explain_select(
     Ok(lines.join("\n"))
 }
 
-fn describe_access_path(table: &Table, predicate: Option<&BoundPredicate>) -> String {
+fn describe_access_path(
+    table: &Table,
+    predicate: Option<&BoundPredicate>,
+    stats: Option<&TableStats>,
+) -> String {
     if let Some((column_index, value)) = index_probe(predicate)
         && let Some(index) = table.index_on_column(column_index)
     {
-        return format!(
+        let mut plan = format!(
             "IndexLookup(index={}, column={}, key={})",
             index.name, index.column, value
         );
+        if let Some(stats) = stats {
+            let estimated = stats.estimate_equality_rows(&index.column);
+            plan.push_str(&format!(", est_rows={estimated}"));
+        }
+        return plan;
+    }
+
+    if let Some(stats) = stats {
+        return format!("SeqScan(rows={})", stats.row_count);
     }
 
     "SeqScan".into()
@@ -478,6 +515,9 @@ fn index_probe(predicate: Option<&BoundPredicate>) -> Option<(usize, Value)> {
             value,
             ..
         }) => Some((*column_index, value.clone())),
+        Some(BoundPredicate::And(left, right)) => {
+            index_probe(Some(left)).or_else(|| index_probe(Some(right)))
+        }
         _ => None,
     }
 }
@@ -585,6 +625,10 @@ fn matches_predicate(row: &Row, predicate: Option<&BoundPredicate>) -> bool {
 }
 
 fn compare_values(left: &Value, op: ComparisonOp, right: &Value) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+
     match op {
         ComparisonOp::Eq => left == right,
         ComparisonOp::Ne => left != right,

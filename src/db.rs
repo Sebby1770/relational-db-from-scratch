@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
+use crate::concurrency::{LockManager, LockMode};
 use crate::error::{DbError, Result};
 use crate::execution::{QueryResult, execute_statement};
+use crate::optimizer::TableStats;
 use crate::parser::parse_sql;
 use crate::row::Row;
 use crate::schema::{TableSchema, normalize_identifier};
@@ -11,6 +13,8 @@ use crate::transaction::{Transaction, TransactionId, UndoRecord};
 #[derive(Debug, Default)]
 pub struct Database {
     pub(crate) tables: HashMap<String, Table>,
+    pub(crate) stats: HashMap<String, TableStats>,
+    pub(crate) lock_manager: LockManager,
     pub(crate) active_transaction: Option<Transaction>,
     next_transaction_id: u64,
 }
@@ -23,6 +27,57 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = parse_sql(sql)?;
         execute_statement(self, statement)
+    }
+
+    pub fn table_names(&self) -> Vec<String> {
+        let mut names = self.tables.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub fn describe_table(&self, table_name: &str) -> Result<String> {
+        let table_name = normalize_identifier(table_name);
+        let table = self
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+
+        let mut lines = vec![format!("table {table_name}")];
+        for column in &table.schema.columns {
+            let mut flags = Vec::new();
+            if column.primary_key {
+                flags.push("PRIMARY KEY");
+            }
+            if column.unique {
+                flags.push("UNIQUE");
+            }
+            if !column.nullable {
+                flags.push("NOT NULL");
+            }
+            let suffix = if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", flags.join(", "))
+            };
+            lines.push(format!("  {} {}{}", column.name, column.data_type, suffix));
+        }
+
+        let indexes = table.index_names();
+        if !indexes.is_empty() {
+            lines.push("indexes:".into());
+            for index_name in indexes {
+                if let Some(index) = table.index(index_name.as_str()) {
+                    let unique = if index.unique { "unique " } else { "" };
+                    lines.push(format!("  {}{} on {}", unique, index.name, index.column));
+                }
+            }
+        }
+
+        if let Some(stats) = self.stats.get(&table_name) {
+            lines.push(format!("rows: {}", stats.row_count));
+        }
+
+        Ok(lines.join("\n"))
     }
 
     pub fn create_table(&mut self, schema: TableSchema) -> Result<()> {
@@ -81,6 +136,7 @@ impl Database {
             .active_transaction
             .take()
             .ok_or_else(|| DbError::Transaction("no active transaction".into()))?;
+        self.lock_manager.release_all(transaction.id);
         Ok(transaction.id)
     }
 
@@ -94,6 +150,7 @@ impl Database {
             self.apply_undo(undo.clone())?;
         }
 
+        self.lock_manager.release_all(transaction.id);
         Ok(transaction.id)
     }
 
@@ -103,10 +160,33 @@ impl Database {
         }
     }
 
+    pub(crate) fn acquire_read_lock(&mut self, resource: &str) -> Result<()> {
+        if let Some(transaction_id) = self.active_transaction_id() {
+            self.lock_manager
+                .acquire(transaction_id, resource, LockMode::Shared)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn acquire_write_lock(&mut self, resource: &str) -> Result<()> {
+        if let Some(transaction_id) = self.active_transaction_id() {
+            self.lock_manager
+                .acquire(transaction_id, resource, LockMode::Exclusive)?;
+        }
+        Ok(())
+    }
+
+    fn active_transaction_id(&self) -> Option<TransactionId> {
+        self.active_transaction
+            .as_ref()
+            .map(|transaction| transaction.id)
+    }
+
     fn apply_undo(&mut self, undo: UndoRecord) -> Result<()> {
         match undo {
             UndoRecord::CreateTable { table } => {
                 self.tables.remove(&table);
+                self.stats.remove(&table);
                 Ok(())
             }
             UndoRecord::CreateIndex { table, index } => {
