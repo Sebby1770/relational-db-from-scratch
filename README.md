@@ -19,7 +19,9 @@ Implemented SQL-facing features:
 - `CREATE TABLE`
 - `CREATE INDEX` and `CREATE UNIQUE INDEX`
 - `INSERT INTO ... VALUES`
-- `SELECT`, projection, `COUNT(*)`, `WHERE`, `ORDER BY`, `LIMIT`
+- `SELECT`, projection, `WHERE`, `ORDER BY`, `LIMIT`
+- Aggregation: `GROUP BY`, `HAVING`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
+  (with `DISTINCT` and `AS` aliases), all with SQL-correct `NULL` handling
 - Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`
 - `UPDATE ... SET ... WHERE ...`
 - `DELETE FROM ... WHERE ...`
@@ -65,6 +67,13 @@ INSERT INTO users VALUES (2, 'grace@example.com', 'Grace Hopper', false);
 
 EXPLAIN SELECT id, name FROM users WHERE email = 'ada@example.com';
 SELECT id, name FROM users WHERE active = true ORDER BY id DESC LIMIT 10;
+
+-- Aggregation with grouping and a post-aggregation filter:
+SELECT active, COUNT(*), COUNT(DISTINCT email)
+FROM users
+GROUP BY active
+HAVING COUNT(*) > 0
+ORDER BY active;
 
 BEGIN;
 UPDATE users SET active = true WHERE id = 2;
@@ -134,6 +143,7 @@ src/
 tests/
   basic_sql.rs    Baseline SQL tests
   advanced_sql.rs Constraints, indexes, predicates, transactions
+  aggregation.rs  GROUP BY, HAVING, COUNT/SUM/AVG/MIN/MAX, NULL rules
   internals.rs    Locking, pages, B+ tree, WAL, statistics
 docs/
   ARCHITECTURE.md Design notes and trade-offs
@@ -167,7 +177,7 @@ Still intentionally not claimed as production-complete:
 - Durable crash recovery
 - Concurrent SQL sessions
 - MVCC visibility rules
-- Join execution and grouped aggregation
+- Join execution (grouped aggregation now works; multi-table joins do not)
 - Cost-based join ordering
 - Real on-disk table files backed by the B+ tree
 

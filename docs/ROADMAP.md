@@ -10,7 +10,7 @@ This repository now includes a broad implementation pass across the full roadmap
 - Week 3: stable row ids, inline constraints, and catalog-like table/index metadata.
 - Week 4: secondary hash indexes, index maintenance, and `EXPLAIN` access path output.
 - Week 5: scan/filter/project style execution and a simple access-path planner; joins remain a next step.
-- Week 6: `COUNT(*)`, `ORDER BY`, `LIMIT`, table statistics, and simple equality estimates; grouped aggregation remains a next step.
+- Week 6: `ORDER BY`, `LIMIT`, table statistics, simple equality estimates, and grouped aggregation — `GROUP BY`, `HAVING`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with SQL NULL semantics. Multi-table joins remain a next step.
 - Week 7: `BEGIN`, `COMMIT`, `ROLLBACK`, undo logging, and a tested lock manager.
 - Week 8: tested slotted page abstraction for the disk-storage path.
 - Week 9: tested educational B+ tree for search, insert, splits, and range scans.
