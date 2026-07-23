@@ -4,10 +4,11 @@ use crate::db::Database;
 use crate::error::{DbError, Result};
 use crate::optimizer::TableStats;
 use crate::parser::{
-    Assignment, ComparisonOp, OrderBy, Predicate, Projection, SortDirection, Statement,
+    AggregateArg, AggregateCall, AggregateFunc, Assignment, ComparisonOp, GroupExpr,
+    HavingPredicate, OrderBy, Predicate, Projection, SelectItem, SortDirection, Statement,
 };
 use crate::row::Row;
-use crate::schema::{TableSchema, normalize_identifier};
+use crate::schema::{DataType, TableSchema, normalize_identifier};
 use crate::storage::{RowId, Table};
 use crate::transaction::UndoRecord;
 use crate::value::Value;
@@ -140,6 +141,8 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
             table,
             projection,
             predicate,
+            group_by,
+            having,
             order_by,
             limit,
         } => select(
@@ -147,6 +150,8 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
             &table,
             &projection,
             predicate.as_ref(),
+            &group_by,
+            having.as_ref(),
             order_by.as_ref(),
             limit,
         ),
@@ -195,11 +200,14 @@ fn insert(db: &mut Database, table_name: &str, row: Row) -> Result<QueryResult> 
     Ok(QueryResult::RowsInserted { count: 1 })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select(
     db: &mut Database,
     table_name: &str,
     projection: &Projection,
     predicate: Option<&Predicate>,
+    group_by: &[String],
+    having: Option<&HavingPredicate>,
     order_by: Option<&OrderBy>,
     limit: Option<usize>,
 ) -> Result<QueryResult> {
@@ -217,6 +225,17 @@ fn select(
             .row(*row_id)
             .is_some_and(|row| matches_predicate(row, predicate.as_ref()))
     });
+
+    // Grouping and aggregation take a separate path: they collapse the
+    // filtered rows into one row per group rather than projecting each row.
+    if let Projection::Aggregate(items) = projection {
+        return aggregate(table, items, group_by, having, order_by, limit, &row_ids);
+    }
+    if !group_by.is_empty() || having.is_some() {
+        return Err(DbError::Parse(
+            "GROUP BY / HAVING require an aggregate or grouped projection".into(),
+        ));
+    }
 
     if let Some(order_by) = order_by {
         let order_column = resolve_column(&table.schema, &order_by.column)?;
@@ -256,6 +275,350 @@ fn select(
         .collect();
 
     Ok(QueryResult::Rows { columns, rows })
+}
+
+/// A `GROUP BY` grouping column resolved against the schema.
+struct ResolvedGroup {
+    /// The column's position in a row.
+    row_index: usize,
+    /// The column's normalized name (its default output label).
+    name: String,
+}
+
+/// An aggregate call resolved against the schema and ready to compute.
+struct ResolvedAgg {
+    func: AggregateFunc,
+    /// `None` for `COUNT(*)`; otherwise the argument column's row index.
+    column: Option<usize>,
+    distinct: bool,
+}
+
+impl ResolvedAgg {
+    fn resolve(schema: &TableSchema, call: &AggregateCall) -> Result<Self> {
+        let column = match &call.arg {
+            AggregateArg::Star => None,
+            AggregateArg::Column(name) => Some(resolve_column(schema, name)?),
+        };
+
+        // SUM and AVG are only meaningful over a numeric column; catching that
+        // here yields a clear error rather than a per-row type surprise.
+        if matches!(call.func, AggregateFunc::Sum | AggregateFunc::Avg)
+            && let Some(index) = column
+            && schema.columns[index].data_type != DataType::Int
+        {
+            return Err(DbError::TypeMismatch {
+                column: schema.columns[index].name.clone(),
+                expected: "INT".into(),
+                got: schema.columns[index].data_type.to_string(),
+            });
+        }
+
+        Ok(ResolvedAgg {
+            func: call.func,
+            column,
+            distinct: call.distinct,
+        })
+    }
+
+    /// Compute this aggregate over one group's rows, applying SQL NULL rules:
+    /// `COUNT(*)` counts every row; every other aggregate skips NULLs, and an
+    /// aggregate over no (non-NULL) values is NULL — except `COUNT`, which is 0.
+    fn compute(&self, table: &Table, rows: &[RowId]) -> Result<Value> {
+        // COUNT(*) is the only aggregate that sees NULL rows.
+        if self.func == AggregateFunc::Count && self.column.is_none() {
+            return Ok(Value::Int(rows.len() as i64));
+        }
+
+        let column = self.column.expect("non-COUNT(*) aggregates have a column");
+        let mut values: Vec<Value> = rows
+            .iter()
+            .filter_map(|id| table.row(*id))
+            .map(|row| row[column].clone())
+            .filter(|value| !value.is_null())
+            .collect();
+
+        if self.distinct {
+            values = dedupe_values(values);
+        }
+
+        match self.func {
+            AggregateFunc::Count => Ok(Value::Int(values.len() as i64)),
+            AggregateFunc::Sum => sum_values(&values),
+            AggregateFunc::Avg => avg_values(&values),
+            AggregateFunc::Min => Ok(min_max_values(&values, Ordering::Less)),
+            AggregateFunc::Max => Ok(min_max_values(&values, Ordering::Greater)),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn aggregate(
+    table: &Table,
+    items: &[SelectItem],
+    group_by: &[String],
+    having: Option<&HavingPredicate>,
+    order_by: Option<&OrderBy>,
+    limit: Option<usize>,
+    row_ids: &[RowId],
+) -> Result<QueryResult> {
+    let schema = &table.schema;
+
+    let groups_cols: Vec<ResolvedGroup> = group_by
+        .iter()
+        .map(|name| {
+            let name = normalize_identifier(name);
+            Ok(ResolvedGroup {
+                row_index: resolve_column(schema, &name)?,
+                name,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    // Resolve each output item. A passthrough column is only legal when it is
+    // one of the grouping columns; otherwise its value is not determined by
+    // the group (the classic "must appear in GROUP BY" error).
+    enum OutputCol {
+        Group(usize), // position within the group key
+        Agg(ResolvedAgg),
+    }
+    let mut output_names = Vec::with_capacity(items.len());
+    let mut output_cols = Vec::with_capacity(items.len());
+
+    for item in items {
+        match item {
+            SelectItem::Column { name, alias } => {
+                let column = normalize_identifier(name);
+                let position = groups_cols
+                    .iter()
+                    .position(|group| group.name == column)
+                    .ok_or_else(|| {
+                        DbError::InvalidStatement(format!(
+                            "column {column} must appear in GROUP BY or an aggregate"
+                        ))
+                    })?;
+                output_names.push(alias.clone().unwrap_or(column));
+                output_cols.push(OutputCol::Group(position));
+            }
+            SelectItem::Aggregate { call, alias } => {
+                let resolved = ResolvedAgg::resolve(schema, call)?;
+                output_names.push(alias.clone().unwrap_or_else(|| default_agg_name(call)));
+                output_cols.push(OutputCol::Agg(resolved));
+            }
+        }
+    }
+
+    // Partition the filtered rows into groups, preserving first-seen order so
+    // output is deterministic without an explicit ORDER BY.
+    let group_indices: Vec<usize> = groups_cols.iter().map(|group| group.row_index).collect();
+    let grouped = partition_into_groups(table, &group_indices, row_ids);
+
+    // Produce one output row per group.
+    let mut out_rows: Vec<(Vec<Value>, Row)> = Vec::with_capacity(grouped.len());
+    for (key, members) in &grouped {
+        // HAVING is evaluated per group, over grouping columns and aggregates.
+        if let Some(having) = having
+            && !eval_having(having, schema, &groups_cols, key, table, members)?
+        {
+            continue;
+        }
+
+        let mut row = Row::with_capacity(output_cols.len());
+        for col in &output_cols {
+            match col {
+                OutputCol::Group(position) => row.push(key[*position].clone()),
+                OutputCol::Agg(agg) => row.push(agg.compute(table, members)?),
+            }
+        }
+        out_rows.push((key.clone(), row));
+    }
+
+    // ORDER BY on the aggregated output references an output column by name.
+    if let Some(order_by) = order_by {
+        let order_column = normalize_identifier(&order_by.column);
+        let position = output_names
+            .iter()
+            .position(|name| name == &order_column)
+            .ok_or_else(|| {
+                DbError::ColumnNotFound(format!("{order_column} (not in the SELECT list)"))
+            })?;
+        out_rows.sort_by(|left, right| {
+            let ordering = left.1[position]
+                .compare_same_type(&right.1[position])
+                .unwrap_or(Ordering::Equal);
+            match order_by.direction {
+                SortDirection::Asc => ordering,
+                SortDirection::Desc => ordering.reverse(),
+            }
+        });
+    }
+
+    let mut rows: Vec<Row> = out_rows.into_iter().map(|(_, row)| row).collect();
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+
+    Ok(QueryResult::Rows {
+        columns: output_names,
+        rows,
+    })
+}
+
+/// Group `row_ids` by the tuple of values in `group_indices`, keeping groups
+/// in first-seen order. An empty `group_indices` collapses everything into a
+/// single group — which, per SQL, exists even when there are no rows, so an
+/// aggregate with no `GROUP BY` still yields one output row.
+fn partition_into_groups(
+    table: &Table,
+    group_indices: &[usize],
+    row_ids: &[RowId],
+) -> Vec<(Vec<Value>, Vec<RowId>)> {
+    use std::collections::HashMap;
+
+    if group_indices.is_empty() {
+        return vec![(Vec::new(), row_ids.to_vec())];
+    }
+
+    let mut order: Vec<Vec<Value>> = Vec::new();
+    let mut buckets: HashMap<Vec<Value>, Vec<RowId>> = HashMap::new();
+
+    for &id in row_ids {
+        let Some(row) = table.row(id) else { continue };
+        let key: Vec<Value> = group_indices.iter().map(|&i| row[i].clone()).collect();
+        if !buckets.contains_key(&key) {
+            order.push(key.clone());
+        }
+        buckets.entry(key).or_default().push(id);
+    }
+
+    order
+        .into_iter()
+        .map(|key| {
+            let members = buckets.remove(&key).unwrap_or_default();
+            (key, members)
+        })
+        .collect()
+}
+
+fn default_agg_name(call: &AggregateCall) -> String {
+    match &call.arg {
+        // Matches the bare-COUNT(*) fast path so both name their column "count".
+        AggregateArg::Star => "count".into(),
+        AggregateArg::Column(column) => {
+            format!("{}_{}", call.func.name(), normalize_identifier(column))
+        }
+    }
+}
+
+fn dedupe_values(values: Vec<Value>) -> Vec<Value> {
+    use std::collections::HashSet;
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn sum_values(values: &[Value]) -> Result<Value> {
+    if values.is_empty() {
+        return Ok(Value::Null); // SUM over no rows is NULL, not 0.
+    }
+    let mut total: i64 = 0;
+    for value in values {
+        match value {
+            Value::Int(n) => {
+                total = total.checked_add(*n).ok_or_else(|| {
+                    DbError::InvalidStatement("SUM overflowed a 64-bit integer".into())
+                })?;
+            }
+            other => {
+                return Err(DbError::TypeMismatch {
+                    column: "SUM argument".into(),
+                    expected: "INT".into(),
+                    got: other.type_name().into(),
+                });
+            }
+        }
+    }
+    Ok(Value::Int(total))
+}
+
+/// AVG returns integer division truncated toward zero: the value model has no
+/// floating-point type, so there is nowhere to put a fractional average.
+fn avg_values(values: &[Value]) -> Result<Value> {
+    if values.is_empty() {
+        return Ok(Value::Null);
+    }
+    let Value::Int(total) = sum_values(values)? else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Int(total / values.len() as i64))
+}
+
+fn min_max_values(values: &[Value], want: Ordering) -> Value {
+    let mut best: Option<&Value> = None;
+    for value in values {
+        match best {
+            None => best = Some(value),
+            Some(current) => {
+                if value.compare_same_type(current) == Some(want) {
+                    best = Some(value);
+                }
+            }
+        }
+    }
+    best.cloned().unwrap_or(Value::Null)
+}
+
+fn eval_having(
+    having: &HavingPredicate,
+    schema: &TableSchema,
+    groups_cols: &[ResolvedGroup],
+    key: &[Value],
+    table: &Table,
+    members: &[RowId],
+) -> Result<bool> {
+    match having {
+        HavingPredicate::And(left, right) => {
+            Ok(eval_having(left, schema, groups_cols, key, table, members)?
+                && eval_having(right, schema, groups_cols, key, table, members)?)
+        }
+        HavingPredicate::Or(left, right) => {
+            Ok(eval_having(left, schema, groups_cols, key, table, members)?
+                || eval_having(right, schema, groups_cols, key, table, members)?)
+        }
+        HavingPredicate::Comparison { left, op, value } => {
+            let actual = eval_group_expr(left, schema, groups_cols, key, table, members)?;
+            Ok(compare_values(&actual, *op, value))
+        }
+    }
+}
+
+fn eval_group_expr(
+    expr: &GroupExpr,
+    schema: &TableSchema,
+    groups_cols: &[ResolvedGroup],
+    key: &[Value],
+    table: &Table,
+    members: &[RowId],
+) -> Result<Value> {
+    match expr {
+        GroupExpr::Column(name) => {
+            let column = normalize_identifier(name);
+            let position = groups_cols
+                .iter()
+                .position(|group| group.name == column)
+                .ok_or_else(|| {
+                    DbError::InvalidStatement(format!(
+                        "HAVING column {column} must appear in GROUP BY"
+                    ))
+                })?;
+            Ok(key[position].clone())
+        }
+        GroupExpr::Aggregate(call) => {
+            let resolved = ResolvedAgg::resolve(schema, call)?;
+            resolved.compute(table, members)
+        }
+    }
 }
 
 fn update(
@@ -404,6 +767,8 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
             table,
             projection,
             predicate,
+            group_by,
+            having,
             order_by,
             limit,
         } => explain_select(
@@ -411,6 +776,8 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
             table,
             projection,
             predicate.as_ref(),
+            group_by,
+            having.as_ref(),
             order_by.as_ref(),
             *limit,
         )?,
@@ -449,11 +816,14 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
     Ok(QueryResult::Plan { plan })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn explain_select(
     db: &Database,
     table: &str,
     projection: &Projection,
     predicate: Option<&Predicate>,
+    group_by: &[String],
+    having: Option<&HavingPredicate>,
     order_by: Option<&OrderBy>,
     limit: Option<usize>,
 ) -> Result<String> {
@@ -463,20 +833,34 @@ fn explain_select(
         .get(&table_name)
         .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
     let predicate = resolve_predicate(&table.schema, predicate)?;
-    let projection = match projection {
+    let is_aggregate = matches!(projection, Projection::Aggregate(_));
+    let projection_text = match projection {
         Projection::All => "*".into(),
         Projection::Columns(columns) => columns.join(", "),
         Projection::CountAll => "COUNT(*)".into(),
+        Projection::Aggregate(items) => describe_aggregate_projection(items),
     };
     let mut lines = vec![
         "Select".to_string(),
         format!("  Table: {table_name}"),
-        format!("  Projection: {projection}"),
+        format!("  Projection: {projection_text}"),
         format!(
             "  Access: {}",
             describe_access_path(table, predicate.as_ref(), db.stats.get(&table_name))
         ),
     ];
+
+    if is_aggregate {
+        let keys: Vec<String> = group_by.iter().map(|c| normalize_identifier(c)).collect();
+        lines.push(format!(
+            "  Aggregate: HashAggregate group_by=[{}]",
+            keys.join(", ")
+        ));
+    }
+
+    if having.is_some() {
+        lines.push("  Having: filter groups".to_string());
+    }
 
     if let Some(order_by) = order_by {
         lines.push(format!(
@@ -491,6 +875,24 @@ fn explain_select(
     }
 
     Ok(lines.join("\n"))
+}
+
+fn describe_aggregate_projection(items: &[SelectItem]) -> String {
+    items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Column { name, .. } => normalize_identifier(name),
+            SelectItem::Aggregate { call, .. } => {
+                let arg = match &call.arg {
+                    AggregateArg::Star => "*".to_string(),
+                    AggregateArg::Column(column) => normalize_identifier(column),
+                };
+                let distinct = if call.distinct { "DISTINCT " } else { "" };
+                format!("{}({distinct}{arg})", call.func.name().to_uppercase())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn describe_access_path(
@@ -567,6 +969,11 @@ fn resolve_projection(
             Ok((names, indexes))
         }
         Projection::CountAll => Ok((vec!["count".into()], Vec::new())),
+        // Aggregated projections are handled entirely by `aggregate()`, which
+        // never routes through this per-row projection helper.
+        Projection::Aggregate(_) => Err(DbError::InvalidStatement(
+            "aggregate projection cannot be resolved as plain columns".into(),
+        )),
     }
 }
 

@@ -28,6 +28,8 @@ pub enum Statement {
         table: String,
         projection: Projection,
         predicate: Option<Predicate>,
+        group_by: Vec<String>,
+        having: Option<HavingPredicate>,
         order_by: Option<OrderBy>,
         limit: Option<usize>,
     },
@@ -54,7 +56,87 @@ pub enum Statement {
 pub enum Projection {
     All,
     Columns(Vec<String>),
+    /// A bare `SELECT COUNT(*)` with no GROUP BY. Kept as its own variant so
+    /// the common whole-table row count stays a trivial path; anything richer
+    /// (grouping, other aggregates, a mix of columns and aggregates) is an
+    /// [`Projection::Aggregate`].
     CountAll,
+    /// A grouped/aggregated projection: a list of grouping columns and/or
+    /// aggregate calls. Produced whenever the query has a `GROUP BY` or the
+    /// select list contains an aggregate function.
+    Aggregate(Vec<SelectItem>),
+}
+
+/// One entry in an aggregated select list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectItem {
+    /// A passthrough column. With `GROUP BY` it must be one of the grouping
+    /// columns — SQL has no meaning for a bare column alongside aggregates
+    /// otherwise.
+    Column { name: String, alias: Option<String> },
+    /// An aggregate function applied over each group.
+    Aggregate {
+        call: AggregateCall,
+        alias: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AggregateCall {
+    pub func: AggregateFunc,
+    pub arg: AggregateArg,
+    /// `COUNT(DISTINCT x)` and friends deduplicate values before aggregating.
+    pub distinct: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggregateFunc {
+    pub fn name(self) -> &'static str {
+        match self {
+            AggregateFunc::Count => "count",
+            AggregateFunc::Sum => "sum",
+            AggregateFunc::Avg => "avg",
+            AggregateFunc::Min => "min",
+            AggregateFunc::Max => "max",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateArg {
+    /// The `*` of `COUNT(*)`: every row, NULLs included.
+    Star,
+    /// A column; NULLs are skipped by every aggregate except `COUNT(*)`.
+    Column(String),
+}
+
+/// A `HAVING` predicate. Unlike `WHERE`, its leaves are evaluated per group,
+/// so they may be grouping columns or aggregate calls — including aggregates
+/// that do not appear in the select list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HavingPredicate {
+    Comparison {
+        left: GroupExpr,
+        op: ComparisonOp,
+        value: Value,
+    },
+    And(Box<HavingPredicate>, Box<HavingPredicate>),
+    Or(Box<HavingPredicate>, Box<HavingPredicate>),
+}
+
+/// Something evaluable once per output group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupExpr {
+    Column(String),
+    Aggregate(AggregateCall),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,6 +338,58 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
     Ok(tokens)
 }
 
+/// Decide which [`Projection`] a parsed select list represents, now that the
+/// presence of a `GROUP BY`/`HAVING` is known.
+///
+/// The empty item list is the `SELECT *` marker. A list of plain columns with
+/// no grouping stays a [`Projection::Columns`] so the simple path is
+/// unchanged; a lone `COUNT(*)` with no grouping or `HAVING` stays a
+/// [`Projection::CountAll`]. Everything else — any aggregate, or any grouping
+/// — becomes a [`Projection::Aggregate`].
+fn finalize_projection(
+    items: Vec<SelectItem>,
+    group_by: &[String],
+    has_having: bool,
+) -> Result<Projection> {
+    if items.is_empty() {
+        if !group_by.is_empty() {
+            return Err(DbError::Parse(
+                "SELECT * cannot be combined with GROUP BY".into(),
+            ));
+        }
+        return Ok(Projection::All);
+    }
+
+    let has_aggregate = items
+        .iter()
+        .any(|item| matches!(item, SelectItem::Aggregate { .. }));
+
+    if group_by.is_empty() && !has_aggregate {
+        let columns = items
+            .into_iter()
+            .map(|item| match item {
+                SelectItem::Column { name, .. } => name,
+                SelectItem::Aggregate { .. } => unreachable!("no aggregates here"),
+            })
+            .collect();
+        return Ok(Projection::Columns(columns));
+    }
+
+    // A single bare COUNT(*) with nothing else keeps the trivial fast path.
+    if group_by.is_empty()
+        && !has_having
+        && items.len() == 1
+        && let SelectItem::Aggregate { call, alias: None } = &items[0]
+        && call.func == AggregateFunc::Count
+        && call.arg == AggregateArg::Star
+        && !call.distinct
+    {
+        return Ok(Projection::CountAll);
+    }
+
+    Ok(Projection::Aggregate(items))
+}
+
 fn is_ident_start(ch: char) -> bool {
     ch.is_ascii_alphabetic() || ch == '_'
 }
@@ -439,44 +573,178 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
-        let projection = self.parse_projection()?;
+        let items = self.parse_select_items()?;
         self.expect_keyword("FROM")?;
         let table = self.expect_ident()?;
         let predicate = self.parse_optional_predicate()?;
+        let group_by = self.parse_optional_group_by()?;
+        let having = self.parse_optional_having()?;
         let order_by = self.parse_optional_order_by()?;
         let limit = self.parse_optional_limit()?;
+
+        let projection = finalize_projection(items, &group_by, having.is_some())?;
 
         Ok(Statement::Select {
             table,
             projection,
             predicate,
+            group_by,
+            having,
             order_by,
             limit,
         })
     }
 
-    fn parse_projection(&mut self) -> Result<Projection> {
+    /// Parse the select list into raw items. `SELECT *` is represented as an
+    /// empty vector — [`finalize_projection`] turns that back into
+    /// [`Projection::All`] once it knows whether a `GROUP BY` is present.
+    fn parse_select_items(&mut self) -> Result<Vec<SelectItem>> {
         if self.consume(Token::Star) {
-            return Ok(Projection::All);
+            return Ok(Vec::new()); // marker for "*"
         }
 
-        if self.consume_keyword("COUNT") {
-            self.expect(Token::LParen)?;
-            self.expect(Token::Star)?;
-            self.expect(Token::RParen)?;
-            return Ok(Projection::CountAll);
-        }
-
-        let mut columns = Vec::new();
+        let mut items = Vec::new();
         loop {
-            columns.push(self.expect_ident()?);
+            if let Some(call) = self.try_parse_aggregate()? {
+                let alias = self.parse_optional_alias()?;
+                items.push(SelectItem::Aggregate { call, alias });
+            } else {
+                // Plain columns keep the current grammar: a bare identifier,
+                // no alias. Aliasing is only offered on aggregates, where an
+                // output name is genuinely useful.
+                let name = self.expect_ident()?;
+                items.push(SelectItem::Column { name, alias: None });
+            }
 
             if !self.consume(Token::Comma) {
                 break;
             }
         }
 
-        Ok(Projection::Columns(columns))
+        Ok(items)
+    }
+
+    /// If the next tokens are `FUNC(...)` for a known aggregate, consume and
+    /// return the call; otherwise leave the cursor untouched and return None
+    /// so the caller can treat it as a plain column.
+    fn try_parse_aggregate(&mut self) -> Result<Option<AggregateCall>> {
+        let func = match self.peek_aggregate_func() {
+            Some(func) => func,
+            None => return Ok(None),
+        };
+
+        // Only commit to the aggregate interpretation if a '(' follows, so an
+        // ordinary column that happens to be named `min` still parses.
+        if self.peek_at(1) != Some(&Token::LParen) {
+            return Ok(None);
+        }
+
+        self.pos += 1; // function name
+        self.expect(Token::LParen)?;
+
+        let distinct = self.consume_keyword("DISTINCT");
+
+        let arg = if self.consume(Token::Star) {
+            if func != AggregateFunc::Count {
+                return Err(DbError::Parse(format!(
+                    "{}(*) is not allowed; only COUNT(*) is",
+                    func.name().to_uppercase()
+                )));
+            }
+            if distinct {
+                return Err(DbError::Parse("COUNT(DISTINCT *) is not valid".into()));
+            }
+            AggregateArg::Star
+        } else {
+            AggregateArg::Column(self.expect_ident()?)
+        };
+
+        self.expect(Token::RParen)?;
+        Ok(Some(AggregateCall {
+            func,
+            arg,
+            distinct,
+        }))
+    }
+
+    fn peek_aggregate_func(&self) -> Option<AggregateFunc> {
+        let Some(Token::Ident(word)) = self.peek() else {
+            return None;
+        };
+        [
+            AggregateFunc::Count,
+            AggregateFunc::Sum,
+            AggregateFunc::Avg,
+            AggregateFunc::Min,
+            AggregateFunc::Max,
+        ]
+        .into_iter()
+        .find(|func| word.eq_ignore_ascii_case(func.name()))
+    }
+
+    fn parse_optional_alias(&mut self) -> Result<Option<String>> {
+        if self.consume_keyword("AS") {
+            return Ok(Some(self.expect_ident()?));
+        }
+        Ok(None)
+    }
+
+    fn parse_optional_group_by(&mut self) -> Result<Vec<String>> {
+        if !self.consume_keyword("GROUP") {
+            return Ok(Vec::new());
+        }
+        self.expect_keyword("BY")?;
+
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.expect_ident()?);
+            if !self.consume(Token::Comma) {
+                break;
+            }
+        }
+        Ok(columns)
+    }
+
+    fn parse_optional_having(&mut self) -> Result<Option<HavingPredicate>> {
+        if !self.consume_keyword("HAVING") {
+            return Ok(None);
+        }
+        self.parse_having_or().map(Some)
+    }
+
+    fn parse_having_or(&mut self) -> Result<HavingPredicate> {
+        let mut left = self.parse_having_and()?;
+        while self.consume_keyword("OR") {
+            let right = self.parse_having_and()?;
+            left = HavingPredicate::Or(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_having_and(&mut self) -> Result<HavingPredicate> {
+        let mut left = self.parse_having_primary()?;
+        while self.consume_keyword("AND") {
+            let right = self.parse_having_primary()?;
+            left = HavingPredicate::And(Box::new(left), Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn parse_having_primary(&mut self) -> Result<HavingPredicate> {
+        if self.consume(Token::LParen) {
+            let inner = self.parse_having_or()?;
+            self.expect(Token::RParen)?;
+            return Ok(inner);
+        }
+
+        let left = if let Some(call) = self.try_parse_aggregate()? {
+            GroupExpr::Aggregate(call)
+        } else {
+            GroupExpr::Column(self.expect_ident()?)
+        };
+        let op = self.parse_comparison_op()?;
+        let value = self.parse_literal()?;
+        Ok(HavingPredicate::Comparison { left, op, value })
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
@@ -692,6 +960,10 @@ impl Parser {
 
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + offset)
     }
 
     fn is_statement_boundary(&self) -> bool {
