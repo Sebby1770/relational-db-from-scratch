@@ -51,10 +51,10 @@ impl Database {
     pub fn execute(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = parse_sql(sql)?;
         let result = execute_statement(self, statement)?;
-        if Self::should_log_sql(sql) {
-            if let Some(persistence) = &self.persistence {
-                persistence.append_sql(sql)?;
-            }
+        if Self::should_log_sql(sql)
+            && let Some(persistence) = &self.persistence
+        {
+            persistence.append_sql(sql)?;
         }
         Ok(result)
     }

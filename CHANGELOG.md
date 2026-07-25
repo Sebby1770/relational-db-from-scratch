@@ -2,6 +2,39 @@
 
 All notable changes to **relational-db-from-scratch** are documented here.
 
+## [Unreleased]
+
+### Added
+- Joins: `INNER JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` and comma joins, with
+  table aliases (`FROM t x`, `AS x`) and qualified `t.col` references
+  everywhere a column may appear. Equi-joins use a hash join; anything else
+  falls back to nested loops, and `EXPLAIN` reports which was chosen per join.
+  Unmatched left rows are NULL-extended, NULL keys never match (not even
+  another NULL), and an ambiguous unqualified column is rejected rather than
+  silently resolved. A join is materialised into a synthetic table with a
+  combined schema, so WHERE, GROUP BY, HAVING, ORDER BY and LIMIT all work
+  over joined queries without duplicated logic. (`src/parser.rs`,
+  `src/execution.rs`)
+- `tests/joins.rs`: 20 tests covering NULL-extension, NULL keys, ambiguity,
+  self-joins, three-way joins, algorithm selection, and aggregation over a join.
+- Aggregation: `GROUP BY`, `HAVING`, and the `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
+  functions, with `DISTINCT` and `AS` aliases, executed by a first-seen-order
+  `HashAggregate`. NULL handling follows the SQL standard: `COUNT(*)` counts
+  NULL rows, other aggregates skip NULLs, an aggregate over no values is NULL
+  (COUNT is 0), an ungrouped aggregate always yields one row, and NULLs form
+  a single group. `SUM`/`AVG` require a numeric column and check for i64
+  overflow; `AVG` is truncated integer division (no float type in the value
+  model). `EXPLAIN` gains a `HashAggregate` line. (`src/parser.rs`,
+  `src/execution.rs`)
+- `tests/aggregation.rs`: 20 tests covering the NULL rules, empty inputs,
+  multi-column grouping, DISTINCT, HAVING with AND/OR, and type errors.
+
+### Changed
+- `Statement::Select` carries `group_by` and `having`; `Projection` gains an
+  `Aggregate` variant. The bare `SELECT COUNT(*)` fast path is unchanged.
+- Fixed two pre-existing clippy lints (`db.rs`, `main.rs`) so
+  `clippy -D warnings` passes.
+
 ## [0.2.0] - 2026-07-04
 
 ### Added

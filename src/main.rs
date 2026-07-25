@@ -5,8 +5,7 @@ use relational_db_from_scratch::Database;
 
 fn main() -> io::Result<()> {
     let mut db = match env::args().nth(1) {
-        Some(path) => Database::open(path)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?,
+        Some(path) => Database::open(path).map_err(|error| io::Error::other(error.to_string()))?,
         None => Database::new(),
     };
     let stdin = io::stdin();
