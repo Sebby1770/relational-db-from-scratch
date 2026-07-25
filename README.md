@@ -22,6 +22,9 @@ Implemented SQL-facing features:
 - `SELECT`, projection, `WHERE`, `ORDER BY`, `LIMIT`
 - Aggregation: `GROUP BY`, `HAVING`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
   (with `DISTINCT` and `AS` aliases), all with SQL-correct `NULL` handling
+- Joins: `INNER JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` and comma joins,
+  with table aliases and qualified `t.col` references; hash join for
+  equi-joins, nested loops otherwise, and `EXPLAIN` names which was used
 - Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`
 - `UPDATE ... SET ... WHERE ...`
 - `DELETE FROM ... WHERE ...`
@@ -74,6 +77,14 @@ FROM users
 GROUP BY active
 HAVING COUNT(*) > 0
 ORDER BY active;
+
+-- Joins, with aliases and a NULL-extended outer side:
+CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, amount INT);
+SELECT u.name, COUNT(o.id), SUM(o.amount)
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.name
+ORDER BY u.name;
 
 BEGIN;
 UPDATE users SET active = true WHERE id = 2;
@@ -144,6 +155,7 @@ tests/
   basic_sql.rs    Baseline SQL tests
   advanced_sql.rs Constraints, indexes, predicates, transactions
   aggregation.rs  GROUP BY, HAVING, COUNT/SUM/AVG/MIN/MAX, NULL rules
+  joins.rs        INNER/LEFT/CROSS joins, aliases, qualified columns
   internals.rs    Locking, pages, B+ tree, WAL, statistics
 docs/
   ARCHITECTURE.md Design notes and trade-offs
@@ -177,7 +189,9 @@ Still intentionally not claimed as production-complete:
 - Durable crash recovery
 - Concurrent SQL sessions
 - MVCC visibility rules
-- Join execution (grouped aggregation now works; multi-table joins do not)
+- Streaming join execution (joins are materialised into an intermediate
+  table rather than pipelined through an operator tree)
+- `RIGHT`/`FULL OUTER` joins, and subqueries
 - Cost-based join ordering
 - Real on-disk table files backed by the B+ tree
 

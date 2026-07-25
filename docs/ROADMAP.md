@@ -9,12 +9,14 @@ This repository now includes a broad implementation pass across the full roadmap
 - Weeks 1-2: working SQL parser, CRUD execution, expressions, sorting, limits, and count.
 - Week 3: stable row ids, inline constraints, and catalog-like table/index metadata.
 - Week 4: secondary hash indexes, index maintenance, and `EXPLAIN` access path output.
-- Week 5: scan/filter/project style execution and a simple access-path planner; joins remain a next step.
-- Week 6: `ORDER BY`, `LIMIT`, table statistics, simple equality estimates, and grouped aggregation — `GROUP BY`, `HAVING`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with SQL NULL semantics. Multi-table joins remain a next step.
+- Week 5: scan/filter/project style execution, a simple access-path planner, and multi-table joins (hash join plus a nested-loop fallback).
+- Week 6: `ORDER BY`, `LIMIT`, table statistics, simple equality estimates, and grouped aggregation — `GROUP BY`, `HAVING`, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX` with SQL NULL semantics.
 - Week 7: `BEGIN`, `COMMIT`, `ROLLBACK`, undo logging, and a tested lock manager.
 - Week 8: tested slotted page abstraction for the disk-storage path.
 - Week 9: tested educational B+ tree for search, insert, splits, and range scans.
 - Week 10: tested WAL record format and optimizer statistics module.
+
+Joins support `INNER`, `LEFT OUTER` and `CROSS` with aliases and qualified columns, but are materialised into an intermediate table rather than streamed through an operator tree; `RIGHT`/`FULL OUTER` joins, subqueries, and cost-based join ordering remain next steps.
 
 The important distinction: this is now a working educational database plus tested internals components. It is not yet a production SQLite clone with durable recovery, concurrent SQL sessions, MVCC snapshots, or a fully cost-based optimizer.
 

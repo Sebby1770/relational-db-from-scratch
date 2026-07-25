@@ -4,11 +4,12 @@ use crate::db::Database;
 use crate::error::{DbError, Result};
 use crate::optimizer::TableStats;
 use crate::parser::{
-    AggregateArg, AggregateCall, AggregateFunc, Assignment, ComparisonOp, GroupExpr,
-    HavingPredicate, OrderBy, Predicate, Projection, SelectItem, SortDirection, Statement,
+    AggregateArg, AggregateCall, AggregateFunc, Assignment, ColumnRef, ComparisonOp, GroupExpr,
+    HavingPredicate, Join, JoinKind, JoinTerm, OrderBy, Predicate, Projection, SelectItem,
+    SortDirection, Statement,
 };
 use crate::row::Row;
-use crate::schema::{DataType, TableSchema, normalize_identifier};
+use crate::schema::{Column, DataType, TableSchema, normalize_identifier};
 use crate::storage::{RowId, Table};
 use crate::transaction::UndoRecord;
 use crate::value::Value;
@@ -139,6 +140,8 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
         Statement::Insert { table, values } => insert(db, &table, values),
         Statement::Select {
             table,
+            table_alias,
+            joins,
             projection,
             predicate,
             group_by,
@@ -148,6 +151,8 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
         } => select(
             db,
             &table,
+            table_alias.as_ref(),
+            &joins,
             &projection,
             predicate.as_ref(),
             &group_by,
@@ -204,6 +209,8 @@ fn insert(db: &mut Database, table_name: &str, row: Row) -> Result<QueryResult> 
 fn select(
     db: &mut Database,
     table_name: &str,
+    table_alias: Option<&String>,
+    joins: &[Join],
     projection: &Projection,
     predicate: Option<&Predicate>,
     group_by: &[String],
@@ -213,10 +220,20 @@ fn select(
 ) -> Result<QueryResult> {
     let table_name = normalize_identifier(table_name);
     db.acquire_read_lock(&table_name)?;
-    let table = db
-        .tables
-        .get(&table_name)
-        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+    for join in joins {
+        db.acquire_read_lock(&normalize_identifier(&join.table))?;
+    }
+
+    // A join is materialised into a synthetic table; everything below then
+    // runs over it exactly as it would over a base table.
+    let joined = build_join_input(db, &table_name, table_alias, joins)?;
+    let table = match &joined {
+        Some((joined_table, _)) => joined_table,
+        None => db
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?,
+    };
     let predicate = resolve_predicate(&table.schema, predicate)?;
     let mut row_ids = candidate_row_ids(table, predicate.as_ref());
 
@@ -275,6 +292,367 @@ fn select(
         .collect();
 
     Ok(QueryResult::Rows { columns, rows })
+}
+
+/* ---- joins -----------------------------------------------------------
+ *
+ * A join is executed by materialising it: the driving table and each joined
+ * table are combined into one synthetic `Table` whose schema carries
+ * qualified column names, and the existing filter / project / aggregate /
+ * sort / limit machinery then runs over that unchanged.
+ *
+ * Materialising costs memory that a streaming operator tree would not, but it
+ * buys something worth more here: every feature the engine already has works
+ * on joined queries the day joins land, with no duplicated logic and nothing
+ * silently unsupported. Streaming is the right next step, not the first one.
+ *
+ * Equality predicates use a hash join; anything else falls back to nested
+ * loops. The planner picks per join and `EXPLAIN` reports which it used.
+ */
+
+/// How a single join was executed, for EXPLAIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JoinAlgorithm {
+    Hash,
+    NestedLoop,
+}
+
+impl JoinAlgorithm {
+    fn name(self) -> &'static str {
+        match self {
+            JoinAlgorithm::Hash => "HashJoin",
+            JoinAlgorithm::NestedLoop => "NestedLoopJoin",
+        }
+    }
+}
+
+/// Qualify a column name with a table/alias: `users` + `id` -> `users.id`.
+fn qualify(prefix: &str, column: &str) -> String {
+    format!("{prefix}.{column}")
+}
+
+/// Build the combined schema for a set of (prefix, schema) inputs. Every
+/// column becomes nullable: a LEFT JOIN NULL-extends unmatched rows, so even
+/// a NOT NULL column can legitimately hold NULL in the join output. Keys and
+/// uniqueness are dropped for the same reason — they describe the base
+/// tables, not the product.
+fn combined_schema(parts: &[(String, &TableSchema)]) -> Result<TableSchema> {
+    let mut columns = Vec::new();
+    for (prefix, schema) in parts {
+        for column in &schema.columns {
+            let mut combined = Column::new(qualify(prefix, &column.name), column.data_type.clone());
+            combined.nullable = true;
+            columns.push(combined);
+        }
+    }
+    TableSchema::new("<join>", columns)
+}
+
+/// Resolve a column reference against a combined schema. An unqualified name
+/// matches on the part after the dot, and is an error if it is ambiguous —
+/// the usual "column reference is ambiguous" that any SQL engine must give.
+fn resolve_joined_column(schema: &TableSchema, name: &str) -> Result<usize> {
+    let wanted = normalize_identifier(name);
+
+    if wanted.contains('.') {
+        return schema
+            .column_index(&wanted)
+            .ok_or(DbError::ColumnNotFound(wanted));
+    }
+
+    let mut found = None;
+    for (index, column) in schema.columns.iter().enumerate() {
+        let unqualified = column.name.split('.').next_back().unwrap_or(&column.name);
+        if unqualified == wanted {
+            if found.is_some() {
+                return Err(DbError::InvalidStatement(format!(
+                    "column reference {wanted} is ambiguous; qualify it with a table name"
+                )));
+            }
+            found = Some(index);
+        }
+    }
+    found.ok_or(DbError::ColumnNotFound(wanted))
+}
+
+/// One join term resolved to concrete column positions in the left (already
+/// combined) and right (newly joined) row layouts.
+struct BoundJoinTerm {
+    left_index: usize,
+    right_index: usize,
+    op: ComparisonOp,
+}
+
+/// Execute the FROM clause, returning a materialised table plus a per-join
+/// description of the algorithm used. Returns `None` when there are no joins,
+/// so the single-table path stays exactly as it was.
+fn build_join_input(
+    db: &Database,
+    table_name: &str,
+    table_alias: Option<&String>,
+    joins: &[Join],
+) -> Result<Option<(Table, Vec<String>)>> {
+    if joins.is_empty() {
+        return Ok(None);
+    }
+
+    let base_name = normalize_identifier(table_name);
+    let base = db
+        .tables
+        .get(&base_name)
+        .ok_or_else(|| DbError::TableNotFound(base_name.clone()))?;
+    let base_prefix = table_alias
+        .map(|alias| normalize_identifier(alias))
+        .unwrap_or_else(|| base_name.clone());
+
+    // Start from the driving table, already qualified.
+    let mut parts: Vec<(String, &TableSchema)> = vec![(base_prefix.clone(), &base.schema)];
+    let mut schema = combined_schema(&parts)?;
+    let mut rows: Vec<Row> = base.rows().cloned().collect();
+    let mut plan = Vec::new();
+
+    for join in joins {
+        let right_name = normalize_identifier(&join.table);
+        let right = db
+            .tables
+            .get(&right_name)
+            .ok_or_else(|| DbError::TableNotFound(right_name.clone()))?;
+        let right_prefix = join
+            .alias
+            .as_ref()
+            .map(|alias| normalize_identifier(alias))
+            .unwrap_or_else(|| right_name.clone());
+
+        if parts.iter().any(|(prefix, _)| prefix == &right_prefix) {
+            return Err(DbError::InvalidStatement(format!(
+                "table name {right_prefix} appears twice; give one of them an alias"
+            )));
+        }
+
+        // Resolve the ON terms: each side may name a column from either input,
+        // so try the left layout first and fall back to the right.
+        let right_schema = &right.schema;
+        let mut terms = Vec::new();
+        if let Some(condition) = &join.on {
+            for term in &condition.terms {
+                let bound = bind_join_term(&schema, right_schema, &right_prefix, term)?;
+                terms.push(bound);
+            }
+        }
+
+        // A hash join needs at least one equality; otherwise nested loops.
+        let algorithm = if terms.iter().any(|t| t.op == ComparisonOp::Eq) {
+            JoinAlgorithm::Hash
+        } else {
+            JoinAlgorithm::NestedLoop
+        };
+
+        let right_rows: Vec<Row> = right.rows().cloned().collect();
+        let right_width = right_schema.columns.len();
+
+        rows = match algorithm {
+            JoinAlgorithm::Hash => hash_join(&rows, &right_rows, &terms, join.kind, right_width),
+            JoinAlgorithm::NestedLoop => {
+                nested_loop_join(&rows, &right_rows, &terms, join.kind, right_width)
+            }
+        };
+
+        plan.push(format!(
+            "{}({} {}, on={})",
+            algorithm.name(),
+            match join.kind {
+                JoinKind::Inner => "INNER",
+                JoinKind::Left => "LEFT",
+                JoinKind::Cross => "CROSS",
+            },
+            right_prefix,
+            join.on
+                .as_ref()
+                .map(|c| c
+                    .terms
+                    .iter()
+                    .map(|t| format!("{} {}", t.left.display(), t.right.display()))
+                    .collect::<Vec<_>>()
+                    .join(" AND "))
+                .unwrap_or_else(|| "-".into())
+        ));
+
+        parts.push((right_prefix, right_schema));
+        schema = combined_schema(&parts)?;
+    }
+
+    // Load the joined rows into a table so the rest of the engine can treat
+    // this exactly like a base table.
+    let mut joined = Table::new(schema);
+    for row in rows {
+        joined.insert(row)?;
+    }
+
+    Ok(Some((joined, plan)))
+}
+
+/// Bind one ON term. Either side may reference the left (combined) input or
+/// the right (newly joined) table; the term is normalised so `left_index`
+/// always refers to the left layout.
+fn bind_join_term(
+    left_schema: &TableSchema,
+    right_schema: &TableSchema,
+    right_prefix: &str,
+    term: &JoinTerm,
+) -> Result<BoundJoinTerm> {
+    let in_right = |reference: &ColumnRef| -> Option<usize> {
+        if let Some(qualifier) = &reference.qualifier
+            && normalize_identifier(qualifier) != right_prefix
+        {
+            return None;
+        }
+        right_schema.column_index(&normalize_identifier(&reference.name))
+    };
+
+    let left_first = resolve_joined_column(left_schema, &term.left.display()).ok();
+    let right_first = in_right(&term.left);
+
+    match (left_first, right_first) {
+        // `left.col op right.col`
+        (Some(left_index), _) => {
+            let right_index = in_right(&term.right).ok_or_else(|| {
+                DbError::ColumnNotFound(format!(
+                    "{} (not a column of {right_prefix})",
+                    term.right.display()
+                ))
+            })?;
+            Ok(BoundJoinTerm {
+                left_index,
+                right_index,
+                op: term.op,
+            })
+        }
+        // `right.col op left.col` — flip so left_index is always the left side.
+        (None, Some(right_index)) => {
+            let left_index = resolve_joined_column(left_schema, &term.right.display())?;
+            Ok(BoundJoinTerm {
+                left_index,
+                right_index,
+                op: flip_op(term.op),
+            })
+        }
+        (None, None) => Err(DbError::ColumnNotFound(term.left.display())),
+    }
+}
+
+/// Reverse a comparison so `a < b` becomes `b > a`.
+fn flip_op(op: ComparisonOp) -> ComparisonOp {
+    match op {
+        ComparisonOp::Eq => ComparisonOp::Eq,
+        ComparisonOp::Ne => ComparisonOp::Ne,
+        ComparisonOp::Lt => ComparisonOp::Gt,
+        ComparisonOp::Lte => ComparisonOp::Gte,
+        ComparisonOp::Gt => ComparisonOp::Lt,
+        ComparisonOp::Gte => ComparisonOp::Lte,
+    }
+}
+
+fn join_terms_match(left: &Row, right: &Row, terms: &[BoundJoinTerm]) -> bool {
+    terms
+        .iter()
+        .all(|term| compare_values(&left[term.left_index], term.op, &right[term.right_index]))
+}
+
+fn null_extend(left: &Row, width: usize) -> Row {
+    let mut row = left.clone();
+    row.extend(std::iter::repeat_n(Value::Null, width));
+    row
+}
+
+fn concat_rows(left: &Row, right: &Row) -> Row {
+    let mut row = left.clone();
+    row.extend(right.iter().cloned());
+    row
+}
+
+/// Nested loops: the general case. Handles any comparison, including none at
+/// all (a cross join).
+fn nested_loop_join(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    terms: &[BoundJoinTerm],
+    kind: JoinKind,
+    right_width: usize,
+) -> Vec<Row> {
+    let mut out = Vec::new();
+    for left in left_rows {
+        let mut matched = false;
+        for right in right_rows {
+            if terms.is_empty() || join_terms_match(left, right, terms) {
+                out.push(concat_rows(left, right));
+                matched = true;
+            }
+        }
+        if !matched && kind == JoinKind::Left {
+            out.push(null_extend(left, right_width));
+        }
+    }
+    out
+}
+
+/// Hash join on the equality terms: build a table from the right input keyed
+/// by those columns, then probe it once per left row. That turns the
+/// quadratic scan into one pass over each side, which is the whole point.
+/// Any non-equality terms are re-checked on each candidate pair.
+fn hash_join(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    terms: &[BoundJoinTerm],
+    kind: JoinKind,
+    right_width: usize,
+) -> Vec<Row> {
+    use std::collections::HashMap;
+
+    let equalities: Vec<&BoundJoinTerm> =
+        terms.iter().filter(|t| t.op == ComparisonOp::Eq).collect();
+    let residual: Vec<&BoundJoinTerm> = terms.iter().filter(|t| t.op != ComparisonOp::Eq).collect();
+
+    // NULL never equals anything, so a row with a NULL key can never match and
+    // is left out of the hash table entirely.
+    let mut buckets: HashMap<Vec<Value>, Vec<&Row>> = HashMap::new();
+    for right in right_rows {
+        let key: Vec<Value> = equalities
+            .iter()
+            .map(|t| right[t.right_index].clone())
+            .collect();
+        if key.iter().any(|value| value.is_null()) {
+            continue;
+        }
+        buckets.entry(key).or_default().push(right);
+    }
+
+    let mut out = Vec::new();
+    for left in left_rows {
+        let key: Vec<Value> = equalities
+            .iter()
+            .map(|t| left[t.left_index].clone())
+            .collect();
+
+        let mut matched = false;
+        if !key.iter().any(|value| value.is_null())
+            && let Some(candidates) = buckets.get(&key)
+        {
+            for right in candidates {
+                if residual
+                    .iter()
+                    .all(|t| compare_values(&left[t.left_index], t.op, &right[t.right_index]))
+                {
+                    out.push(concat_rows(left, right));
+                    matched = true;
+                }
+            }
+        }
+
+        if !matched && kind == JoinKind::Left {
+            out.push(null_extend(left, right_width));
+        }
+    }
+    out
 }
 
 /// A `GROUP BY` grouping column resolved against the schema.
@@ -765,6 +1143,8 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
     let plan = match statement {
         Statement::Select {
             table,
+            table_alias,
+            joins,
             projection,
             predicate,
             group_by,
@@ -774,6 +1154,8 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
         } => explain_select(
             db,
             table,
+            table_alias.as_ref(),
+            joins,
             projection,
             predicate.as_ref(),
             group_by,
@@ -820,6 +1202,8 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
 fn explain_select(
     db: &Database,
     table: &str,
+    table_alias: Option<&String>,
+    joins: &[Join],
     projection: &Projection,
     predicate: Option<&Predicate>,
     group_by: &[String],
@@ -828,10 +1212,19 @@ fn explain_select(
     limit: Option<usize>,
 ) -> Result<String> {
     let table_name = normalize_identifier(table);
-    let table = db
-        .tables
-        .get(&table_name)
-        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+
+    // Planning a join means building it, since the combined schema is what
+    // the predicate and projection resolve against.
+    let joined = build_join_input(db, &table_name, table_alias, joins)?;
+    let (table, join_plan) = match &joined {
+        Some((joined_table, plan)) => (joined_table, plan.clone()),
+        None => (
+            db.tables
+                .get(&table_name)
+                .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?,
+            Vec::new(),
+        ),
+    };
     let predicate = resolve_predicate(&table.schema, predicate)?;
     let is_aggregate = matches!(projection, Projection::Aggregate(_));
     let projection_text = match projection {
@@ -844,11 +1237,16 @@ fn explain_select(
         "Select".to_string(),
         format!("  Table: {table_name}"),
         format!("  Projection: {projection_text}"),
-        format!(
-            "  Access: {}",
-            describe_access_path(table, predicate.as_ref(), db.stats.get(&table_name))
-        ),
     ];
+
+    for step in &join_plan {
+        lines.push(format!("  Join: {step}"));
+    }
+
+    lines.push(format!(
+        "  Access: {}",
+        describe_access_path(table, predicate.as_ref(), db.stats.get(&table_name))
+    ));
 
     if is_aggregate {
         let keys: Vec<String> = group_by.iter().map(|c| normalize_identifier(c)).collect();
@@ -1029,10 +1427,15 @@ fn resolve_predicate_inner(schema: &TableSchema, predicate: &Predicate) -> Resul
 }
 
 fn resolve_column(schema: &TableSchema, column: &str) -> Result<usize> {
-    let column = normalize_identifier(column);
-    schema
-        .column_index(&column)
-        .ok_or(DbError::ColumnNotFound(column))
+    let name = normalize_identifier(column);
+    // Exact match first: this is the only case for a base table, whose column
+    // names never contain a dot.
+    if let Some(index) = schema.column_index(&name) {
+        return Ok(index);
+    }
+    // Otherwise the schema is a join's combined schema, whose names are
+    // qualified — fall back to matching on the unqualified part.
+    resolve_joined_column(schema, &name)
 }
 
 fn matches_predicate(row: &Row, predicate: Option<&BoundPredicate>) -> bool {

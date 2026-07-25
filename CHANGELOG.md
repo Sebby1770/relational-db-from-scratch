@@ -5,6 +5,18 @@ All notable changes to **relational-db-from-scratch** are documented here.
 ## [Unreleased]
 
 ### Added
+- Joins: `INNER JOIN`, `LEFT [OUTER] JOIN`, `CROSS JOIN` and comma joins, with
+  table aliases (`FROM t x`, `AS x`) and qualified `t.col` references
+  everywhere a column may appear. Equi-joins use a hash join; anything else
+  falls back to nested loops, and `EXPLAIN` reports which was chosen per join.
+  Unmatched left rows are NULL-extended, NULL keys never match (not even
+  another NULL), and an ambiguous unqualified column is rejected rather than
+  silently resolved. A join is materialised into a synthetic table with a
+  combined schema, so WHERE, GROUP BY, HAVING, ORDER BY and LIMIT all work
+  over joined queries without duplicated logic. (`src/parser.rs`,
+  `src/execution.rs`)
+- `tests/joins.rs`: 20 tests covering NULL-extension, NULL keys, ambiguity,
+  self-joins, three-way joins, algorithm selection, and aggregation over a join.
 - Aggregation: `GROUP BY`, `HAVING`, and the `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`
   functions, with `DISTINCT` and `AS` aliases, executed by a first-seen-order
   `HashAggregate`. NULL handling follows the SQL standard: `COUNT(*)` counts

@@ -25,7 +25,13 @@ pub enum Statement {
         values: Vec<Value>,
     },
     Select {
+        /// The driving table. Kept as a plain name so every existing caller
+        /// and test that reads `table` still works.
         table: String,
+        /// Alias for the driving table, if `FROM t AS x` was written.
+        table_alias: Option<String>,
+        /// Tables joined onto it, in written order.
+        joins: Vec<Join>,
         projection: Projection,
         predicate: Option<Predicate>,
         group_by: Vec<String>,
@@ -65,6 +71,55 @@ pub enum Projection {
     /// aggregate calls. Produced whenever the query has a `GROUP BY` or the
     /// select list contains an aggregate function.
     Aggregate(Vec<SelectItem>),
+}
+
+/// One joined table: how to join it, and on what.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Join {
+    pub table: String,
+    pub alias: Option<String>,
+    pub kind: JoinKind,
+    /// `None` for CROSS JOIN and comma joins, which pair every row.
+    pub on: Option<JoinCondition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    /// Keeps unmatched left rows, NULL-extending the right side.
+    Left,
+    Cross,
+}
+
+/// A join predicate. Restricted to a conjunction of column comparisons, which
+/// is what an equi-join needs and what the hash join can exploit; anything
+/// richer belongs in `WHERE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinCondition {
+    pub terms: Vec<JoinTerm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinTerm {
+    pub left: ColumnRef,
+    pub op: ComparisonOp,
+    pub right: ColumnRef,
+}
+
+/// A possibly table-qualified column reference: `col` or `t.col`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRef {
+    pub qualifier: Option<String>,
+    pub name: String,
+}
+
+impl ColumnRef {
+    pub fn display(&self) -> String {
+        match &self.qualifier {
+            Some(q) => format!("{q}.{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 /// One entry in an aggregated select list.
@@ -187,6 +242,7 @@ enum Token {
     LParen,
     RParen,
     Star,
+    Dot,
     Eq,
     Ne,
     Lt,
@@ -287,6 +343,10 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
             }
             '*' => {
                 tokens.push(Token::Star);
+                index += 1;
+            }
+            '.' => {
+                tokens.push(Token::Dot);
                 index += 1;
             }
             '=' => {
@@ -576,6 +636,8 @@ impl Parser {
         let items = self.parse_select_items()?;
         self.expect_keyword("FROM")?;
         let table = self.expect_ident()?;
+        let table_alias = self.parse_optional_table_alias()?;
+        let joins = self.parse_joins()?;
         let predicate = self.parse_optional_predicate()?;
         let group_by = self.parse_optional_group_by()?;
         let having = self.parse_optional_having()?;
@@ -586,12 +648,125 @@ impl Parser {
 
         Ok(Statement::Select {
             table,
+            table_alias,
+            joins,
             projection,
             predicate,
             group_by,
             having,
             order_by,
             limit,
+        })
+    }
+
+    /// `FROM t x` or `FROM t AS x`. A bare identifier is only an alias if it
+    /// is not a keyword that ends the FROM item — otherwise `FROM t WHERE ...`
+    /// would silently alias the table to `where`.
+    fn parse_optional_table_alias(&mut self) -> Result<Option<String>> {
+        if self.consume_keyword("AS") {
+            return Ok(Some(self.expect_ident()?));
+        }
+
+        const RESERVED: [&str; 10] = [
+            "where", "group", "having", "order", "limit", "join", "inner", "left", "cross", "on",
+        ];
+        if let Some(Token::Ident(word)) = self.peek() {
+            let lowered = word.to_ascii_lowercase();
+            if !RESERVED.contains(&lowered.as_str()) {
+                return Ok(Some(self.expect_ident()?));
+            }
+        }
+        Ok(None)
+    }
+
+    fn parse_joins(&mut self) -> Result<Vec<Join>> {
+        let mut joins = Vec::new();
+
+        loop {
+            // A comma in the FROM list is an implicit CROSS JOIN.
+            let kind = if self.consume(Token::Comma) {
+                JoinKind::Cross
+            } else if self.consume_keyword("CROSS") {
+                self.expect_keyword("JOIN")?;
+                JoinKind::Cross
+            } else if self.consume_keyword("INNER") {
+                self.expect_keyword("JOIN")?;
+                JoinKind::Inner
+            } else if self.consume_keyword("LEFT") {
+                // OUTER is noise: LEFT JOIN and LEFT OUTER JOIN are the same.
+                let _ = self.consume_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinKind::Left
+            } else if self.consume_keyword("JOIN") {
+                JoinKind::Inner // bare JOIN means INNER JOIN
+            } else {
+                break;
+            };
+
+            let table = self.expect_ident()?;
+            let alias = self.parse_optional_table_alias()?;
+
+            let on = if self.consume_keyword("ON") {
+                Some(self.parse_join_condition()?)
+            } else {
+                None
+            };
+
+            if kind != JoinKind::Cross && on.is_none() {
+                return Err(DbError::Parse(format!(
+                    "{} JOIN requires an ON clause",
+                    if kind == JoinKind::Left {
+                        "LEFT"
+                    } else {
+                        "INNER"
+                    }
+                )));
+            }
+            if kind == JoinKind::Cross && on.is_some() {
+                return Err(DbError::Parse(
+                    "CROSS JOIN does not take an ON clause".into(),
+                ));
+            }
+
+            joins.push(Join {
+                table,
+                alias,
+                kind,
+                on,
+            });
+        }
+
+        Ok(joins)
+    }
+
+    fn parse_join_condition(&mut self) -> Result<JoinCondition> {
+        let mut terms = Vec::new();
+        loop {
+            let left = self.parse_column_ref()?;
+            let op = self.parse_comparison_op()?;
+            let right = self.parse_column_ref()?;
+            terms.push(JoinTerm { left, op, right });
+
+            if !self.consume_keyword("AND") {
+                break;
+            }
+        }
+        Ok(JoinCondition { terms })
+    }
+
+    /// `col` or `qualifier.col`.
+    fn parse_column_ref(&mut self) -> Result<ColumnRef> {
+        let first = self.expect_ident()?;
+        if self.consume(Token::Dot) {
+            let name = self.expect_ident()?;
+            return Ok(ColumnRef {
+                qualifier: Some(first),
+                name,
+            });
+        }
+        Ok(ColumnRef {
+            qualifier: None,
+            name: first,
         })
     }
 
@@ -612,7 +787,7 @@ impl Parser {
                 // Plain columns keep the current grammar: a bare identifier,
                 // no alias. Aliasing is only offered on aggregates, where an
                 // output name is genuinely useful.
-                let name = self.expect_ident()?;
+                let name = self.expect_column_name()?;
                 items.push(SelectItem::Column { name, alias: None });
             }
 
@@ -656,7 +831,7 @@ impl Parser {
             }
             AggregateArg::Star
         } else {
-            AggregateArg::Column(self.expect_ident()?)
+            AggregateArg::Column(self.expect_column_name()?)
         };
 
         self.expect(Token::RParen)?;
@@ -697,7 +872,7 @@ impl Parser {
 
         let mut columns = Vec::new();
         loop {
-            columns.push(self.expect_ident()?);
+            columns.push(self.expect_column_name()?);
             if !self.consume(Token::Comma) {
                 break;
             }
@@ -740,7 +915,7 @@ impl Parser {
         let left = if let Some(call) = self.try_parse_aggregate()? {
             GroupExpr::Aggregate(call)
         } else {
-            GroupExpr::Column(self.expect_ident()?)
+            GroupExpr::Column(self.expect_column_name()?)
         };
         let op = self.parse_comparison_op()?;
         let value = self.parse_literal()?;
@@ -816,7 +991,7 @@ impl Parser {
             return Ok(predicate);
         }
 
-        let column = self.expect_ident()?;
+        let column = self.expect_column_name()?;
         let op = self.parse_comparison_op()?;
         let value = self.parse_literal()?;
         Ok(Predicate::Comparison { column, op, value })
@@ -845,7 +1020,7 @@ impl Parser {
         }
 
         self.expect_keyword("BY")?;
-        let column = self.expect_ident()?;
+        let column = self.expect_column_name()?;
         let direction = if self.consume_keyword("DESC") {
             SortDirection::Desc
         } else {
@@ -899,6 +1074,19 @@ impl Parser {
             Some(other) => Err(DbError::Parse(format!("expected literal, got {other:?}"))),
             None => Err(DbError::Parse("expected literal, got end of input".into())),
         }
+    }
+
+    /// A column name, possibly table-qualified. `t.col` becomes the single
+    /// identifier "t.col"; the executor resolves it against the (combined)
+    /// schema. Keeping it as one string means projections, predicates,
+    /// ORDER BY and GROUP BY need no AST changes to support joins.
+    fn expect_column_name(&mut self) -> Result<String> {
+        let first = self.expect_ident()?;
+        if self.consume(Token::Dot) {
+            let second = self.expect_ident()?;
+            return Ok(format!("{first}.{second}"));
+        }
+        Ok(first)
     }
 
     fn expect_ident(&mut self) -> Result<String> {
