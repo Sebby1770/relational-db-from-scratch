@@ -1,5 +1,5 @@
 use relational_db_from_scratch::parser::{
-    ComparisonOp, Predicate, Projection, Statement, parse_sql,
+    ComparisonOp, JoinType, Predicate, Projection, SelectItem, Statement, parse_sql,
 };
 
 #[test]
@@ -25,7 +25,7 @@ fn parses_select_with_order_and_limit() {
             ..
         } => {
             assert!(matches!(projection, Projection::Columns(_)));
-            assert!(order_by.is_some());
+            assert!(!order_by.is_empty());
             assert_eq!(limit, Some(5));
         }
         other => panic!("unexpected statement: {other:?}"),
@@ -78,6 +78,71 @@ fn parses_comparison_operators() {
             ..
         } => {
             assert_eq!(op, ComparisonOp::Gte);
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_join_group_like_offset_and_copy() {
+    let join = parse_sql(
+        "SELECT users.name, orders.total FROM users JOIN orders ON users.id = orders.user_id;",
+    )
+    .unwrap();
+    match join {
+        Statement::Select { joins, offset, .. } => {
+            assert_eq!(joins.len(), 1);
+            assert_eq!(joins[0].join_type, JoinType::Inner);
+            assert_eq!(joins[0].left, "users.id");
+            assert_eq!(joins[0].right, "orders.user_id");
+            assert_eq!(offset, None);
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let grouped = parse_sql("SELECT dept, COUNT(*), SUM(n) FROM emp GROUP BY dept;").unwrap();
+    match grouped {
+        Statement::Select {
+            projection: Projection::Items(items),
+            group_by,
+            ..
+        } => {
+            assert!(matches!(items[0], SelectItem::Column(_)));
+            assert!(matches!(items[1], SelectItem::CountAll));
+            assert!(matches!(items[2], SelectItem::Sum(_)));
+            assert_eq!(group_by, vec!["dept"]);
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let like = parse_sql("SELECT word FROM words WHERE word LIKE 'foo%';").unwrap();
+    assert!(matches!(
+        like,
+        Statement::Select {
+            predicate: Some(Predicate::Like { .. }),
+            ..
+        }
+    ));
+
+    let limited = parse_sql("SELECT id FROM users ORDER BY id LIMIT 10 OFFSET 5;").unwrap();
+    match limited {
+        Statement::Select { limit, offset, .. } => {
+            assert_eq!(limit, Some(10));
+            assert_eq!(offset, Some(5));
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    assert!(matches!(
+        parse_sql("COPY users FROM 'users.csv';").unwrap(),
+        Statement::CopyFrom { .. }
+    ));
+
+    let left =
+        parse_sql("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;").unwrap();
+    match left {
+        Statement::Select { joins, .. } => {
+            assert_eq!(joins[0].join_type, JoinType::Left);
         }
         other => panic!("unexpected statement: {other:?}"),
     }

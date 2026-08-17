@@ -19,20 +19,22 @@ Implemented SQL-facing features:
 - `CREATE TABLE`
 - `CREATE INDEX` and `CREATE UNIQUE INDEX`
 - `INSERT INTO ... VALUES`
-- `SELECT`, projection, `COUNT(*)`, `WHERE`, `ORDER BY`, `LIMIT`
-- Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`
+- `SELECT`, projection, `COUNT(*)`, `SUM(column)`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT n OFFSET m`
+- `INNER JOIN` / `JOIN` and `LEFT JOIN` with nested-loop execution
+- Qualified columns (`users.name`) plus unambiguous short names after a join
+- Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `AND`, `OR`
 - `UPDATE ... SET ... WHERE ...`
 - `DELETE FROM ... WHERE ...`
-- `EXPLAIN` for scan vs index lookup
+- `COPY table FROM 'file.csv'` and REPL `.import <path> <table>` (CSV header = columns)
+- `EXPLAIN` for scan vs index lookup, nested-loop join, and hash aggregation
 - `BEGIN`, `COMMIT`, `ROLLBACK` with an in-memory undo log
 - `ANALYZE` collects per-table statistics used by `EXPLAIN`
-- `CHECKPOINT` placeholder for the WAL milestone
 - SQL-correct `NULL` handling in `WHERE` predicates (unknown comparisons filter out)
 - Compound `AND` predicates can use equality indexes
 - Table-level lock manager integrated with active transactions
 - O(1) row lookup via hash-backed table storage
 - Strict type checking
-- REPL meta commands: `.tables`, `.schema`, `.help`
+- REPL meta commands: `.tables`, `.schema`, `.import`, `.help`
 - Persistent storage with snapshot files + append-only WAL replay
 - `Database::open(path)` and `cargo run -- <data-dir>` for durable sessions
 - `CHECKPOINT` writes a snapshot and truncates the WAL
@@ -64,7 +66,19 @@ INSERT INTO users VALUES (1, 'ada@example.com', 'Ada Lovelace', true);
 INSERT INTO users VALUES (2, 'grace@example.com', 'Grace Hopper', false);
 
 EXPLAIN SELECT id, name FROM users WHERE email = 'ada@example.com';
-SELECT id, name FROM users WHERE active = true ORDER BY id DESC LIMIT 10;
+SELECT id, name FROM users WHERE active = true ORDER BY id DESC LIMIT 10 OFFSET 0;
+
+CREATE TABLE orders (id INT PRIMARY KEY, user_id INT, total INT);
+INSERT INTO orders VALUES (10, 1, 120);
+
+SELECT users.name, orders.total
+FROM users
+JOIN orders ON users.id = orders.user_id
+WHERE orders.total > 100;
+
+SELECT active, COUNT(*), SUM(id) FROM users GROUP BY active;
+SELECT name FROM users WHERE name LIKE 'Ada%';
+COPY users FROM 'users.csv';
 
 BEGIN;
 UPDATE users SET active = true WHERE id = 2;
@@ -92,6 +106,7 @@ Inside the REPL:
 db> CREATE TABLE users (id INT, name TEXT, active BOOL);
 db> INSERT INTO users VALUES (1, 'Ada Lovelace', true);
 db> SELECT * FROM users;
+db> .import users.csv users
 db> .quit
 ```
 
@@ -134,6 +149,7 @@ src/
 tests/
   basic_sql.rs    Baseline SQL tests
   advanced_sql.rs Constraints, indexes, predicates, transactions
+  v03_sql.rs      JOIN, GROUP BY, LIKE, OFFSET, CSV import
   internals.rs    Locking, pages, B+ tree, WAL, statistics
 docs/
   ARCHITECTURE.md Design notes and trade-offs
@@ -167,8 +183,8 @@ Still intentionally not claimed as production-complete:
 - Durable crash recovery
 - Concurrent SQL sessions
 - MVCC visibility rules
-- Join execution and grouped aggregation
-- Cost-based join ordering
+- Hash join and cost-based join ordering
+- `HAVING`, window functions, and subqueries
 - Real on-disk table files backed by the B+ tree
 
 Those are the right next deepening steps after this broad pass.

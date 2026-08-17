@@ -2,6 +2,25 @@
 
 All notable changes to **relational-db-from-scratch** are documented here.
 
+## [0.3.0] - 2026-08-18
+
+### Added
+- `INNER JOIN` / `JOIN` with nested-loop execution: `FROM t1 JOIN t2 ON t1.col = t2.col`
+- `LEFT JOIN` with NULL-extended unmatched right rows
+- Qualified columns (`t1.col`) and unambiguous short names after a join
+- Table aliases (`FROM users u JOIN orders o ON u.id = o.user_id`)
+- `GROUP BY` with hash aggregation
+- `COUNT(*)` and `SUM(column)` in the select list, including mixed grouped projections
+- `LIKE` predicates: `col LIKE 'foo%'`, `'%bar'`, `'%mid%'`, optional `ESCAPE`
+- `LIMIT n OFFSET m` (OFFSET is applied after `ORDER BY`, then LIMIT)
+- CSV import via `COPY table FROM 'path'` and the REPL meta command `.import <path> <table>`
+- `EXPLAIN` reports `nested loop join` for joins and `hash group by` for grouped queries
+- Integration tests for JOIN, GROUP BY, LIKE, OFFSET, and CSV import (38 tests total)
+
+### Changed
+- `SELECT` AST now carries joins, `GROUP BY`, and `OFFSET`
+- README, roadmap snapshot, and SQL examples cover the 0.3 query surface
+
 ## [0.2.0] - 2026-07-04
 
 ### Added

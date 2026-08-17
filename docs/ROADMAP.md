@@ -4,17 +4,19 @@ This schedule assumes focused part-time work. If you only have weekends, treat e
 
 ## Implementation Snapshot
 
-This repository now includes a broad implementation pass across the full roadmap:
+This repository now includes a broad implementation pass across the full roadmap, plus the 0.3.0 query surface (2026-08-18):
 
 - Weeks 1-2: working SQL parser, CRUD execution, expressions, sorting, limits, and count.
 - Week 3: stable row ids, inline constraints, and catalog-like table/index metadata.
 - Week 4: secondary hash indexes, index maintenance, and `EXPLAIN` access path output.
-- Week 5: scan/filter/project style execution and a simple access-path planner; joins remain a next step.
-- Week 6: `COUNT(*)`, `ORDER BY`, `LIMIT`, table statistics, and simple equality estimates; grouped aggregation remains a next step.
+- Week 5: scan/filter/project style execution, a simple access-path planner, and nested-loop `INNER`/`LEFT JOIN`.
+- Week 6: `COUNT(*)`, `SUM`, `GROUP BY` hash aggregation, `ORDER BY`, `LIMIT n OFFSET m`, `LIKE`, and CSV `COPY` / `.import`.
 - Week 7: `BEGIN`, `COMMIT`, `ROLLBACK`, undo logging, and a tested lock manager.
 - Week 8: tested slotted page abstraction for the disk-storage path.
 - Week 9: tested educational B+ tree for search, insert, splits, and range scans.
 - Week 10: tested WAL record format and optimizer statistics module.
+
+Still next after 0.3.0: hash join, `HAVING`, cost-based join order, and on-disk table files.
 
 The important distinction: this is now a working educational database plus tested internals components. It is not yet a production SQLite clone with durable recovery, concurrent SQL sessions, MVCC snapshots, or a fully cost-based optimizer.
 

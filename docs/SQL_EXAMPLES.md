@@ -85,7 +85,24 @@ SELECT id, name
 FROM users
 WHERE active = true
 ORDER BY name ASC
-LIMIT 10;
+LIMIT 10 OFFSET 0;
+
+SELECT name FROM users WHERE name LIKE 'Ada%';
+SELECT name FROM users WHERE name LIKE '%Hopper';
+```
+
+## CSV import
+
+Header row names the columns. Extra table columns that are nullable become `NULL`.
+
+```sql
+COPY users FROM 'users.csv';
+```
+
+In the REPL:
+
+```text
+.import users.csv users
 ```
 
 ## Transactions

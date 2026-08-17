@@ -26,10 +26,14 @@ pub enum Statement {
     },
     Select {
         table: String,
+        alias: Option<String>,
+        joins: Vec<JoinClause>,
         projection: Projection,
         predicate: Option<Predicate>,
-        order_by: Option<OrderBy>,
+        group_by: Vec<String>,
+        order_by: Vec<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
     },
     Update {
         table: String,
@@ -39,6 +43,10 @@ pub enum Statement {
     Delete {
         table: String,
         predicate: Option<Predicate>,
+    },
+    CopyFrom {
+        table: String,
+        path: String,
     },
     Explain(Box<Statement>),
     Begin,
@@ -55,6 +63,29 @@ pub enum Projection {
     All,
     Columns(Vec<String>),
     CountAll,
+    Items(Vec<SelectItem>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectItem {
+    Column(String),
+    CountAll,
+    Sum(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: String,
+    pub alias: Option<String>,
+    pub left: String,
+    pub right: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +94,11 @@ pub enum Predicate {
         column: String,
         op: ComparisonOp,
         value: Value,
+    },
+    Like {
+        column: String,
+        pattern: String,
+        escape: Option<char>,
     },
     And(Box<Predicate>, Box<Predicate>),
     Or(Box<Predicate>, Box<Predicate>),
@@ -105,6 +141,7 @@ enum Token {
     LParen,
     RParen,
     Star,
+    Dot,
     Eq,
     Ne,
     Lt,
@@ -207,6 +244,10 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Star);
                 index += 1;
             }
+            '.' => {
+                tokens.push(Token::Dot);
+                index += 1;
+            }
             '=' => {
                 tokens.push(Token::Eq);
                 index += 1;
@@ -264,6 +305,30 @@ fn is_ident_continue(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
+fn is_reserved_after_table(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        "WHERE"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "CROSS"
+            | "OUTER"
+            | "ON"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            | "HAVING"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "AS"
+    )
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -299,6 +364,10 @@ impl Parser {
 
         if self.consume_keyword("CHECKPOINT") {
             return Ok(Statement::Checkpoint);
+        }
+
+        if self.consume_keyword("COPY") {
+            return self.parse_copy();
         }
 
         if self.consume_keyword("DROP") {
@@ -438,20 +507,42 @@ impl Parser {
         Ok(Statement::Insert { table, values })
     }
 
+    fn parse_copy(&mut self) -> Result<Statement> {
+        let table = self.expect_ident()?;
+        self.expect_keyword("FROM")?;
+        let path = match self.advance() {
+            Some(Token::String(path)) => path,
+            Some(other) => {
+                return Err(DbError::Parse(format!(
+                    "expected csv path string, got {other:?}"
+                )));
+            }
+            None => return Err(DbError::Parse("expected csv path string".into())),
+        };
+
+        Ok(Statement::CopyFrom { table, path })
+    }
+
     fn parse_select(&mut self) -> Result<Statement> {
         let projection = self.parse_projection()?;
         self.expect_keyword("FROM")?;
-        let table = self.expect_ident()?;
+        let (table, alias) = self.parse_table_ref()?;
+        let joins = self.parse_joins()?;
         let predicate = self.parse_optional_predicate()?;
-        let order_by = self.parse_optional_order_by()?;
-        let limit = self.parse_optional_limit()?;
+        let group_by = self.parse_optional_group_by()?;
+        let order_by = self.parse_order_by_list()?;
+        let (limit, offset) = self.parse_optional_limit_offset()?;
 
         Ok(Statement::Select {
             table,
+            alias,
+            joins,
             projection,
             predicate,
+            group_by,
             order_by,
             limit,
+            offset,
         })
     }
 
@@ -460,23 +551,105 @@ impl Parser {
             return Ok(Projection::All);
         }
 
-        if self.consume_keyword("COUNT") {
-            self.expect(Token::LParen)?;
-            self.expect(Token::Star)?;
-            self.expect(Token::RParen)?;
-            return Ok(Projection::CountAll);
-        }
-
-        let mut columns = Vec::new();
+        let mut items = Vec::new();
         loop {
-            columns.push(self.expect_ident()?);
-
+            items.push(self.parse_select_item()?);
             if !self.consume(Token::Comma) {
                 break;
             }
         }
 
-        Ok(Projection::Columns(columns))
+        if items.len() == 1 && matches!(items[0], SelectItem::CountAll) {
+            return Ok(Projection::CountAll);
+        }
+
+        if items
+            .iter()
+            .all(|item| matches!(item, SelectItem::Column(_)))
+        {
+            let columns = items
+                .into_iter()
+                .map(|item| match item {
+                    SelectItem::Column(column) => column,
+                    _ => unreachable!("filtered to columns"),
+                })
+                .collect();
+            return Ok(Projection::Columns(columns));
+        }
+
+        Ok(Projection::Items(items))
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        if self.peek_function("COUNT") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            self.expect(Token::Star)?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::CountAll);
+        }
+
+        if self.peek_function("SUM") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Sum(column));
+        }
+
+        Ok(SelectItem::Column(self.parse_column_ref()?))
+    }
+
+    fn parse_table_ref(&mut self) -> Result<(String, Option<String>)> {
+        let table = self.expect_ident()?;
+        if self.consume_keyword("AS") {
+            return Ok((table, Some(self.expect_ident()?)));
+        }
+        if self.next_is_table_alias() {
+            return Ok((table, Some(self.expect_ident()?)));
+        }
+        Ok((table, None))
+    }
+
+    fn next_is_table_alias(&self) -> bool {
+        match self.peek() {
+            Some(Token::Ident(value)) => !is_reserved_after_table(value),
+            _ => false,
+        }
+    }
+
+    fn parse_joins(&mut self) -> Result<Vec<JoinClause>> {
+        let mut joins = Vec::new();
+
+        loop {
+            let join_type = if self.consume_keyword("INNER") {
+                self.expect_keyword("JOIN")?;
+                JoinType::Inner
+            } else if self.consume_keyword("LEFT") {
+                let _ = self.consume_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinType::Left
+            } else if self.consume_keyword("JOIN") {
+                JoinType::Inner
+            } else {
+                break;
+            };
+
+            let (table, alias) = self.parse_table_ref()?;
+            self.expect_keyword("ON")?;
+            let left = self.parse_column_ref()?;
+            self.expect(Token::Eq)?;
+            let right = self.parse_column_ref()?;
+            joins.push(JoinClause {
+                join_type,
+                table,
+                alias,
+                left,
+                right,
+            });
+        }
+
+        Ok(joins)
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
@@ -548,10 +721,56 @@ impl Parser {
             return Ok(predicate);
         }
 
-        let column = self.expect_ident()?;
+        let column = self.parse_column_ref()?;
+        if self.consume_keyword("LIKE") {
+            return self.parse_like(column);
+        }
+
         let op = self.parse_comparison_op()?;
         let value = self.parse_literal()?;
         Ok(Predicate::Comparison { column, op, value })
+    }
+
+    fn parse_like(&mut self, column: String) -> Result<Predicate> {
+        let pattern = match self.advance() {
+            Some(Token::String(pattern)) => pattern,
+            Some(other) => {
+                return Err(DbError::Parse(format!(
+                    "expected LIKE pattern string, got {other:?}"
+                )));
+            }
+            None => return Err(DbError::Parse("expected LIKE pattern string".into())),
+        };
+
+        let escape = if self.consume_keyword("ESCAPE") {
+            match self.advance() {
+                Some(Token::String(value)) => {
+                    let mut chars = value.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(escape), None) => Some(escape),
+                        _ => {
+                            return Err(DbError::Parse(
+                                "ESCAPE clause must be a single character".into(),
+                            ));
+                        }
+                    }
+                }
+                Some(other) => {
+                    return Err(DbError::Parse(format!(
+                        "expected ESCAPE character string, got {other:?}"
+                    )));
+                }
+                None => return Err(DbError::Parse("expected ESCAPE character string".into())),
+            }
+        } else {
+            None
+        };
+
+        Ok(Predicate::Like {
+            column,
+            pattern,
+            escape,
+        })
     }
 
     fn parse_comparison_op(&mut self) -> Result<ComparisonOp> {
@@ -571,39 +790,83 @@ impl Parser {
         }
     }
 
-    fn parse_optional_order_by(&mut self) -> Result<Option<OrderBy>> {
-        if !self.consume_keyword("ORDER") {
-            return Ok(None);
+    fn parse_optional_group_by(&mut self) -> Result<Vec<String>> {
+        if !self.consume_keyword("GROUP") {
+            return Ok(Vec::new());
         }
 
         self.expect_keyword("BY")?;
-        let column = self.expect_ident()?;
-        let direction = if self.consume_keyword("DESC") {
-            SortDirection::Desc
-        } else {
-            let _ = self.consume_keyword("ASC");
-            SortDirection::Asc
-        };
-
-        Ok(Some(OrderBy { column, direction }))
-    }
-
-    fn parse_optional_limit(&mut self) -> Result<Option<usize>> {
-        if !self.consume_keyword("LIMIT") {
-            return Ok(None);
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_column_ref()?);
+            if !self.consume(Token::Comma) {
+                break;
+            }
         }
 
-        let limit = match self.advance() {
-            Some(Token::Number(value)) if value >= 0 => value as usize,
-            Some(other) => {
-                return Err(DbError::Parse(format!(
-                    "expected non-negative LIMIT literal, got {other:?}"
-                )));
+        if columns.is_empty() {
+            return Err(DbError::Parse("expected column after GROUP BY".into()));
+        }
+
+        Ok(columns)
+    }
+
+    fn parse_order_by_list(&mut self) -> Result<Vec<OrderBy>> {
+        if !self.consume_keyword("ORDER") {
+            return Ok(Vec::new());
+        }
+
+        self.expect_keyword("BY")?;
+        let mut keys = Vec::new();
+        loop {
+            let column = self.parse_column_ref()?;
+            let direction = if self.consume_keyword("DESC") {
+                SortDirection::Desc
+            } else {
+                let _ = self.consume_keyword("ASC");
+                SortDirection::Asc
+            };
+            keys.push(OrderBy { column, direction });
+            if !self.consume(Token::Comma) {
+                break;
             }
-            None => return Err(DbError::Parse("expected LIMIT literal".into())),
+        }
+
+        if keys.is_empty() {
+            return Err(DbError::Parse("expected column after ORDER BY".into()));
+        }
+
+        Ok(keys)
+    }
+
+    fn parse_optional_limit_offset(&mut self) -> Result<(Option<usize>, Option<usize>)> {
+        if self.consume_keyword("OFFSET") {
+            let offset = self.expect_non_negative_int("OFFSET")?;
+            return Ok((None, Some(offset)));
+        }
+
+        if !self.consume_keyword("LIMIT") {
+            return Ok((None, None));
+        }
+
+        let limit = self.expect_non_negative_int("LIMIT")?;
+        let offset = if self.consume_keyword("OFFSET") {
+            Some(self.expect_non_negative_int("OFFSET")?)
+        } else {
+            None
         };
 
-        Ok(Some(limit))
+        Ok((Some(limit), offset))
+    }
+
+    fn expect_non_negative_int(&mut self, label: &str) -> Result<usize> {
+        match self.advance() {
+            Some(Token::Number(value)) if value >= 0 => Ok(value as usize),
+            Some(other) => Err(DbError::Parse(format!(
+                "expected non-negative {label} literal, got {other:?}"
+            ))),
+            None => Err(DbError::Parse(format!("expected {label} literal"))),
+        }
     }
 
     fn parse_data_type(&mut self) -> Result<DataType> {
@@ -633,6 +896,16 @@ impl Parser {
         }
     }
 
+    fn parse_column_ref(&mut self) -> Result<String> {
+        let first = self.expect_ident()?;
+        if self.consume(Token::Dot) {
+            let second = self.expect_ident()?;
+            Ok(format!("{first}.{second}"))
+        } else {
+            Ok(first)
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<String> {
         match self.advance() {
             Some(Token::Ident(value)) => Ok(normalize_identifier(&value)),
@@ -659,6 +932,13 @@ impl Parser {
                 self.pos += 1;
                 true
             }
+            _ => false,
+        }
+    }
+
+    fn peek_function(&self, name: &str) -> bool {
+        match (self.peek(), self.tokens.get(self.pos + 1)) {
+            (Some(Token::Ident(ident)), Some(Token::LParen)) => ident.eq_ignore_ascii_case(name),
             _ => false,
         }
     }

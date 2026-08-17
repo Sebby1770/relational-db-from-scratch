@@ -1,13 +1,16 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::fs;
 
 use crate::db::Database;
 use crate::error::{DbError, Result};
 use crate::optimizer::TableStats;
 use crate::parser::{
-    Assignment, ComparisonOp, OrderBy, Predicate, Projection, SortDirection, Statement,
+    Assignment, ComparisonOp, JoinClause, JoinType, OrderBy, Predicate, Projection, SelectItem,
+    SortDirection, Statement,
 };
 use crate::row::Row;
-use crate::schema::{TableSchema, normalize_identifier};
+use crate::schema::{Column, DataType, TableSchema, normalize_identifier};
 use crate::storage::{RowId, Table};
 use crate::transaction::UndoRecord;
 use crate::value::Value;
@@ -90,8 +93,165 @@ enum BoundPredicate {
         op: ComparisonOp,
         value: Value,
     },
+    Like {
+        column_index: usize,
+        pattern: String,
+        escape: Option<char>,
+    },
     And(Box<BoundPredicate>, Box<BoundPredicate>),
     Or(Box<BoundPredicate>, Box<BoundPredicate>),
+}
+
+#[derive(Debug, Clone)]
+struct QueryColumn {
+    qualifiers: Vec<String>,
+    name: String,
+    output_name: String,
+    data_type: DataType,
+}
+
+#[derive(Debug, Clone)]
+struct QuerySchema {
+    columns: Vec<QueryColumn>,
+}
+
+impl QuerySchema {
+    fn from_table(table_name: &str, alias: Option<&str>, schema: &TableSchema) -> Self {
+        let table_name = normalize_identifier(table_name);
+        let mut qualifiers = vec![table_name];
+        if let Some(alias) = alias {
+            let alias = normalize_identifier(alias);
+            if !qualifiers.contains(&alias) {
+                qualifiers.push(alias);
+            }
+        }
+
+        let columns = schema
+            .columns
+            .iter()
+            .map(|column| QueryColumn {
+                qualifiers: qualifiers.clone(),
+                name: column.name.clone(),
+                output_name: column.name.clone(),
+                data_type: column.data_type.clone(),
+            })
+            .collect();
+
+        Self { columns }
+    }
+
+    fn merge(mut self, other: QuerySchema) -> Self {
+        self.columns.extend(other.columns);
+        let mut counts = HashMap::new();
+        for column in &self.columns {
+            *counts.entry(column.name.clone()).or_insert(0usize) += 1;
+        }
+
+        for column in &mut self.columns {
+            column.output_name = if counts[&column.name] > 1 {
+                format!("{}.{}", display_qualifier(column), column.name)
+            } else {
+                column.name.clone()
+            };
+        }
+
+        self
+    }
+
+    fn resolve(&self, column: &str) -> Result<usize> {
+        let column = normalize_identifier(column);
+        if let Some((qualifier, name)) = split_qualified(&column) {
+            let matches = matching_indexes(self, |item| {
+                item.name == name && item.qualifiers.iter().any(|value| value == &qualifier)
+            });
+            return unique_match(matches, &column);
+        }
+
+        let matches = matching_indexes(self, |item| item.name == column);
+        unique_match(matches, &column)
+    }
+
+    fn from_output_names(names: &[String]) -> Self {
+        let columns = names
+            .iter()
+            .map(|name| {
+                let (qualifiers, bare) = if let Some((qualifier, rest)) = split_qualified(name) {
+                    (vec![qualifier], rest)
+                } else {
+                    (Vec::new(), name.clone())
+                };
+                QueryColumn {
+                    qualifiers,
+                    name: bare,
+                    output_name: name.clone(),
+                    data_type: DataType::Int,
+                }
+            })
+            .collect();
+        Self { columns }
+    }
+}
+
+fn display_qualifier(column: &QueryColumn) -> &str {
+    column.qualifiers.last().map(String::as_str).unwrap_or("")
+}
+
+fn matching_indexes(schema: &QuerySchema, predicate: impl Fn(&QueryColumn) -> bool) -> Vec<usize> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| predicate(column).then_some(index))
+        .collect()
+}
+
+fn unique_match(matches: Vec<usize>, column: &str) -> Result<usize> {
+    match matches.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(DbError::ColumnNotFound(column.to_string())),
+        _ => Err(DbError::InvalidStatement(format!(
+            "ambiguous column: {column}"
+        ))),
+    }
+}
+
+fn split_qualified(column: &str) -> Option<(String, String)> {
+    column
+        .split_once('.')
+        .map(|(qualifier, name)| (qualifier.to_string(), name.to_string()))
+}
+
+#[derive(Debug, Clone)]
+enum BoundSelectItem {
+    Column { index: usize, output_name: String },
+    CountAll,
+    Sum { index: usize, output_name: String },
+}
+
+impl BoundSelectItem {
+    fn output_name(&self) -> String {
+        match self {
+            BoundSelectItem::Column { output_name, .. }
+            | BoundSelectItem::Sum { output_name, .. } => output_name.clone(),
+            BoundSelectItem::CountAll => "count".into(),
+        }
+    }
+
+    fn is_aggregate(&self) -> bool {
+        !matches!(self, BoundSelectItem::Column { .. })
+    }
+}
+
+struct SelectQuery<'a> {
+    table: &'a str,
+    alias: Option<&'a str>,
+    joins: &'a [JoinClause],
+    projection: &'a Projection,
+    predicate: Option<&'a Predicate>,
+    group_by: &'a [String],
+    order_by: &'a [OrderBy],
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Result<QueryResult> {
@@ -138,17 +298,27 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
         Statement::Insert { table, values } => insert(db, &table, values),
         Statement::Select {
             table,
+            alias,
+            joins,
             projection,
             predicate,
+            group_by,
             order_by,
             limit,
+            offset,
         } => select(
             db,
-            &table,
-            &projection,
-            predicate.as_ref(),
-            order_by.as_ref(),
-            limit,
+            SelectQuery {
+                table: &table,
+                alias: alias.as_deref(),
+                joins: &joins,
+                projection: &projection,
+                predicate: predicate.as_ref(),
+                group_by: &group_by,
+                order_by: &order_by,
+                limit,
+                offset,
+            },
         ),
         Statement::Update {
             table,
@@ -156,6 +326,7 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
             predicate,
         } => update(db, &table, &assignments, predicate.as_ref()),
         Statement::Delete { table, predicate } => delete(db, &table, predicate.as_ref()),
+        Statement::CopyFrom { table, path } => copy_from(db, &table, &path),
         Statement::Explain(statement) => explain(db, &statement),
         Statement::Begin => {
             let id = db.begin()?.0;
@@ -195,67 +366,421 @@ fn insert(db: &mut Database, table_name: &str, row: Row) -> Result<QueryResult> 
     Ok(QueryResult::RowsInserted { count: 1 })
 }
 
-fn select(
-    db: &mut Database,
-    table_name: &str,
-    projection: &Projection,
-    predicate: Option<&Predicate>,
-    order_by: Option<&OrderBy>,
-    limit: Option<usize>,
-) -> Result<QueryResult> {
-    let table_name = normalize_identifier(table_name);
-    db.acquire_read_lock(&table_name)?;
-    let table = db
+fn select(db: &mut Database, query: SelectQuery<'_>) -> Result<QueryResult> {
+    let left_name = normalize_identifier(query.table);
+    db.acquire_read_lock(&left_name)?;
+    for join in query.joins {
+        db.acquire_read_lock(&normalize_identifier(&join.table))?;
+    }
+
+    let (schema, mut rows) = scan_and_join(db, &query)?;
+    if !query.joins.is_empty() {
+        let predicate = resolve_query_predicate(&schema, query.predicate)?;
+        rows.retain(|row| matches_predicate(row, predicate.as_ref()));
+    }
+
+    let items = bind_projection(&schema, query.projection)?;
+    let grouped = !query.group_by.is_empty() || items.iter().any(BoundSelectItem::is_aggregate);
+
+    let (columns, mut output_rows) = if grouped {
+        aggregate_rows(&schema, &rows, &items, query.group_by)?
+    } else {
+        sort_rows(&schema, &mut rows, query.order_by)?;
+        apply_offset_limit(&mut rows, query.offset, query.limit);
+        let columns = items
+            .iter()
+            .map(BoundSelectItem::output_name)
+            .collect::<Vec<_>>();
+        let output_rows = rows
+            .into_iter()
+            .map(|row| project_row(&row, &items))
+            .collect();
+        (columns, output_rows)
+    };
+
+    if grouped {
+        let output_schema = QuerySchema::from_output_names(&columns);
+        sort_rows(&output_schema, &mut output_rows, query.order_by)?;
+        apply_offset_limit(&mut output_rows, query.offset, query.limit);
+    }
+
+    Ok(QueryResult::Rows {
+        columns,
+        rows: output_rows,
+    })
+}
+
+fn scan_and_join(db: &Database, query: &SelectQuery<'_>) -> Result<(QuerySchema, Vec<Row>)> {
+    let left_name = normalize_identifier(query.table);
+    let left_table = db
         .tables
-        .get(&table_name)
-        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        .get(&left_name)
+        .ok_or_else(|| DbError::TableNotFound(left_name.clone()))?;
+    let mut schema = QuerySchema::from_table(&left_name, query.alias, &left_table.schema);
+    let mut rows = if query.joins.is_empty() {
+        collect_matching_rows(left_table, query.predicate)?
+    } else {
+        left_table.rows().cloned().collect()
+    };
+
+    for join in query.joins {
+        let right_name = normalize_identifier(&join.table);
+        let right_table = db
+            .tables
+            .get(&right_name)
+            .ok_or_else(|| DbError::TableNotFound(right_name.clone()))?;
+        let right_schema =
+            QuerySchema::from_table(&right_name, join.alias.as_deref(), &right_table.schema);
+        let (left_index, right_index) =
+            resolve_join_columns(&schema, &right_schema, &join.left, &join.right)?;
+        let right_width = right_schema.columns.len();
+        let right_rows = right_table.rows().cloned().collect::<Vec<_>>();
+        rows = nested_loop_join(
+            &rows,
+            &right_rows,
+            left_index,
+            right_index,
+            join.join_type,
+            right_width,
+        );
+        schema = schema.merge(right_schema);
+    }
+
+    Ok((schema, rows))
+}
+
+fn collect_matching_rows(table: &Table, predicate: Option<&Predicate>) -> Result<Vec<Row>> {
     let predicate = resolve_predicate(&table.schema, predicate)?;
     let mut row_ids = candidate_row_ids(table, predicate.as_ref());
-
     row_ids.retain(|row_id| {
         table
             .row(*row_id)
             .is_some_and(|row| matches_predicate(row, predicate.as_ref()))
     });
-
-    if let Some(order_by) = order_by {
-        let order_column = resolve_column(&table.schema, &order_by.column)?;
-        row_ids.sort_by(|left_id, right_id| {
-            let left = &table.row(*left_id).expect("candidate row exists")[order_column];
-            let right = &table.row(*right_id).expect("candidate row exists")[order_column];
-            let ordering = left.compare_same_type(right).unwrap_or(Ordering::Equal);
-
-            match order_by.direction {
-                SortDirection::Asc => ordering,
-                SortDirection::Desc => ordering.reverse(),
-            }
-        });
-    }
-
-    if let Some(limit) = limit {
-        row_ids.truncate(limit);
-    }
-
-    if projection == &Projection::CountAll {
-        return Ok(QueryResult::Rows {
-            columns: vec!["count".into()],
-            rows: vec![vec![Value::Int(row_ids.len() as i64)]],
-        });
-    }
-
-    let (columns, column_indexes) = resolve_projection(&table.schema, projection)?;
-    let rows = row_ids
+    Ok(row_ids
         .into_iter()
-        .filter_map(|row_id| table.row(row_id))
-        .map(|row| {
-            column_indexes
-                .iter()
-                .map(|index| row[*index].clone())
-                .collect::<Row>()
+        .filter_map(|row_id| table.row(row_id).cloned())
+        .collect())
+}
+
+fn resolve_join_columns(
+    left: &QuerySchema,
+    right: &QuerySchema,
+    first: &str,
+    second: &str,
+) -> Result<(usize, usize)> {
+    let first_on_left = left.resolve(first);
+    let second_on_right = right.resolve(second);
+    if let (Ok(left_index), Ok(right_index)) = (&first_on_left, &second_on_right) {
+        return Ok((*left_index, *right_index));
+    }
+
+    let first_on_right = right.resolve(first);
+    let second_on_left = left.resolve(second);
+    if let (Ok(right_index), Ok(left_index)) = (&first_on_right, &second_on_left) {
+        return Ok((*left_index, *right_index));
+    }
+
+    if first_on_left.is_err() && first_on_right.is_err() {
+        return Err(DbError::ColumnNotFound(normalize_identifier(first)));
+    }
+    if second_on_left.is_err() && second_on_right.is_err() {
+        return Err(DbError::ColumnNotFound(normalize_identifier(second)));
+    }
+
+    Err(DbError::InvalidStatement(format!(
+        "cannot resolve join condition {first} = {second}"
+    )))
+}
+
+fn nested_loop_join(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_index: usize,
+    right_index: usize,
+    join_type: JoinType,
+    right_width: usize,
+) -> Vec<Row> {
+    let mut output = Vec::new();
+
+    for left in left_rows {
+        let mut matched = false;
+        for right in right_rows {
+            if join_values_equal(&left[left_index], &right[right_index]) {
+                let mut row = left.clone();
+                row.extend(right.iter().cloned());
+                output.push(row);
+                matched = true;
+            }
+        }
+
+        if !matched && join_type == JoinType::Left {
+            let mut row = left.clone();
+            row.extend(std::iter::repeat_n(Value::Null, right_width));
+            output.push(row);
+        }
+    }
+
+    output
+}
+
+fn join_values_equal(left: &Value, right: &Value) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+    left == right
+}
+
+fn bind_projection(schema: &QuerySchema, projection: &Projection) -> Result<Vec<BoundSelectItem>> {
+    match projection {
+        Projection::All => Ok(schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| BoundSelectItem::Column {
+                index,
+                output_name: column.output_name.clone(),
+            })
+            .collect()),
+        Projection::Columns(columns) => columns
+            .iter()
+            .map(|column| {
+                let index = schema.resolve(column)?;
+                Ok(BoundSelectItem::Column {
+                    index,
+                    output_name: column_output_name(column),
+                })
+            })
+            .collect(),
+        Projection::CountAll => Ok(vec![BoundSelectItem::CountAll]),
+        Projection::Items(items) => items
+            .iter()
+            .map(|item| bind_select_item(schema, item))
+            .collect(),
+    }
+}
+
+fn bind_select_item(schema: &QuerySchema, item: &SelectItem) -> Result<BoundSelectItem> {
+    match item {
+        SelectItem::Column(column) => {
+            let index = schema.resolve(column)?;
+            Ok(BoundSelectItem::Column {
+                index,
+                output_name: column_output_name(column),
+            })
+        }
+        SelectItem::CountAll => Ok(BoundSelectItem::CountAll),
+        SelectItem::Sum(column) => {
+            let index = schema.resolve(column)?;
+            if schema.columns[index].data_type != DataType::Int {
+                return Err(DbError::TypeMismatch {
+                    column: column.clone(),
+                    expected: "INT".into(),
+                    got: schema.columns[index].data_type.to_string(),
+                });
+            }
+            Ok(BoundSelectItem::Sum {
+                index,
+                output_name: "sum".into(),
+            })
+        }
+    }
+}
+
+fn column_output_name(column: &str) -> String {
+    normalize_identifier(column)
+}
+
+fn project_row(row: &Row, items: &[BoundSelectItem]) -> Row {
+    items
+        .iter()
+        .map(|item| match item {
+            BoundSelectItem::Column { index, .. } => row[*index].clone(),
+            BoundSelectItem::CountAll | BoundSelectItem::Sum { .. } => {
+                unreachable!("aggregates are projected by hash grouping")
+            }
+        })
+        .collect()
+}
+
+fn aggregate_rows(
+    schema: &QuerySchema,
+    rows: &[Row],
+    items: &[BoundSelectItem],
+    group_by: &[String],
+) -> Result<(Vec<String>, Vec<Row>)> {
+    let group_indexes = group_by
+        .iter()
+        .map(|column| schema.resolve(column))
+        .collect::<Result<Vec<_>>>()?;
+
+    if group_indexes.is_empty() && items.iter().any(|item| !item.is_aggregate()) {
+        return Err(DbError::InvalidStatement(
+            "column must appear in GROUP BY or be an aggregate".into(),
+        ));
+    }
+
+    for item in items {
+        if let BoundSelectItem::Column { index, output_name } = item
+            && !group_indexes.contains(index)
+        {
+            return Err(DbError::InvalidStatement(format!(
+                "column {output_name} must appear in GROUP BY or be an aggregate"
+            )));
+        }
+    }
+
+    let columns = items
+        .iter()
+        .map(BoundSelectItem::output_name)
+        .collect::<Vec<_>>();
+    let sum_indexes = items
+        .iter()
+        .filter_map(|item| match item {
+            BoundSelectItem::Sum { index, .. } => Some(*index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    if group_indexes.is_empty() {
+        return Ok((columns, vec![aggregate_group(rows, items, &sum_indexes)]));
+    }
+
+    let mut groups: HashMap<Vec<Value>, Vec<Row>> = HashMap::new();
+    for row in rows {
+        let key = group_indexes
+            .iter()
+            .map(|index| row[*index].clone())
+            .collect::<Vec<_>>();
+        groups.entry(key).or_default().push(row.clone());
+    }
+
+    let mut keys = groups.keys().cloned().collect::<Vec<_>>();
+    keys.sort_by(|left, right| cmp_value_lists(left, right));
+
+    let output = keys
+        .into_iter()
+        .map(|key| {
+            let group_rows = groups.get(&key).expect("grouped rows exist");
+            aggregate_group(group_rows, items, &sum_indexes)
         })
         .collect();
 
-    Ok(QueryResult::Rows { columns, rows })
+    Ok((columns, output))
+}
+
+fn aggregate_group(rows: &[Row], items: &[BoundSelectItem], sum_indexes: &[usize]) -> Row {
+    let count = rows.len() as i64;
+    let sums = sum_indexes
+        .iter()
+        .map(|index| {
+            let mut total: Option<i64> = None;
+            for row in rows {
+                if let Value::Int(value) = row[*index] {
+                    total = Some(total.unwrap_or(0) + value);
+                }
+            }
+            total
+        })
+        .collect::<Vec<_>>();
+
+    let mut sum_cursor = 0;
+    items
+        .iter()
+        .map(|item| match item {
+            BoundSelectItem::Column { index, .. } => rows
+                .first()
+                .map(|row| row[*index].clone())
+                .unwrap_or(Value::Null),
+            BoundSelectItem::CountAll => Value::Int(count),
+            BoundSelectItem::Sum { .. } => {
+                let value = match sums[sum_cursor] {
+                    Some(total) => Value::Int(total),
+                    None => Value::Null,
+                };
+                sum_cursor += 1;
+                value
+            }
+        })
+        .collect()
+}
+
+fn sort_rows(schema: &QuerySchema, rows: &mut [Row], order_by: &[OrderBy]) -> Result<()> {
+    if order_by.is_empty() {
+        return Ok(());
+    }
+
+    let keys = order_by
+        .iter()
+        .map(|key| {
+            let index = resolve_order_column(schema, &key.column)?;
+            Ok((index, key.direction))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    rows.sort_by(|left, right| {
+        for (index, direction) in &keys {
+            let ordering = cmp_values(&left[*index], &right[*index]);
+            let ordering = match direction {
+                SortDirection::Asc => ordering,
+                SortDirection::Desc => ordering.reverse(),
+            };
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    });
+    Ok(())
+}
+
+fn resolve_order_column(schema: &QuerySchema, column: &str) -> Result<usize> {
+    let column = normalize_identifier(column);
+    if let Ok(index) = schema.resolve(&column) {
+        return Ok(index);
+    }
+
+    let matches = matching_indexes(schema, |item| item.output_name == column);
+    if let Ok(index) = unique_match(matches, &column) {
+        return Ok(index);
+    }
+
+    schema.resolve(&column)
+}
+
+fn apply_offset_limit(rows: &mut Vec<Row>, offset: Option<usize>, limit: Option<usize>) {
+    if let Some(offset) = offset {
+        if offset >= rows.len() {
+            rows.clear();
+        } else {
+            rows.drain(..offset);
+        }
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+}
+
+fn cmp_value_lists(left: &[Value], right: &[Value]) -> Ordering {
+    for (left_value, right_value) in left.iter().zip(right.iter()) {
+        let ordering = cmp_values(left_value, right_value);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn cmp_values(left: &Value, right: &Value) -> Ordering {
+    if let Some(ordering) = left.compare_same_type(right) {
+        return ordering;
+    }
+
+    match (left.is_null(), right.is_null()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => left.type_name().cmp(right.type_name()),
+    }
 }
 
 fn update(
@@ -365,6 +890,196 @@ fn delete(
     Ok(QueryResult::RowsDeleted { count: deleted })
 }
 
+fn copy_from(db: &mut Database, table_name: &str, path: &str) -> Result<QueryResult> {
+    let table_name = normalize_identifier(table_name);
+    db.acquire_write_lock(&table_name)?;
+    let schema = db
+        .tables
+        .get(&table_name)
+        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?
+        .schema
+        .clone();
+
+    let content = fs::read_to_string(path)?;
+    let mut records = parse_csv(&content)?;
+    if records.is_empty() {
+        return Err(DbError::InvalidStatement(format!(
+            "csv file {path} is empty"
+        )));
+    }
+
+    let header = records
+        .remove(0)
+        .into_iter()
+        .map(|name| normalize_identifier(&name))
+        .collect::<Vec<_>>();
+    let mapping = header
+        .iter()
+        .map(|name| {
+            schema
+                .column_index(name)
+                .ok_or_else(|| DbError::ColumnNotFound(name.clone()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut prepared = Vec::new();
+    for record in records {
+        if record.len() == 1 && record[0].is_empty() && header.len() != 1 {
+            continue;
+        }
+        if record.len() != header.len() {
+            return Err(DbError::InvalidStatement(format!(
+                "csv row has {} field(s) but header has {}",
+                record.len(),
+                header.len()
+            )));
+        }
+
+        let mut row = vec![Value::Null; schema.columns.len()];
+        for (csv_index, &column_index) in mapping.iter().enumerate() {
+            row[column_index] = csv_value(&schema.columns[column_index], &record[csv_index])?;
+        }
+        prepared.push(row);
+    }
+
+    let mut undo_records = Vec::new();
+    {
+        let table = db
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let mut inserted_ids = Vec::new();
+
+        for row in prepared {
+            match table.insert(row) {
+                Ok(row_id) => inserted_ids.push(row_id),
+                Err(error) => {
+                    for row_id in inserted_ids.iter().rev() {
+                        let _ = table.delete_row(*row_id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        for row_id in inserted_ids {
+            undo_records.push(UndoRecord::Insert {
+                table: table_name.clone(),
+                row_id,
+            });
+        }
+    }
+
+    let inserted = undo_records.len();
+    for undo in undo_records {
+        db.record_undo(undo);
+    }
+
+    Ok(QueryResult::RowsInserted { count: inserted })
+}
+
+fn parse_csv(content: &str) -> Result<Vec<Vec<String>>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut chars = content.chars().peekable();
+    let mut in_quotes = false;
+    let mut saw_field = false;
+
+    while let Some(ch) = chars.next() {
+        if in_quotes {
+            if ch == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(ch);
+            }
+            saw_field = true;
+            continue;
+        }
+
+        match ch {
+            '"' => {
+                in_quotes = true;
+                saw_field = true;
+            }
+            ',' => {
+                row.push(std::mem::take(&mut field));
+                saw_field = true;
+            }
+            '\n' => {
+                row.push(std::mem::take(&mut field));
+                if row.iter().any(|value| !value.is_empty()) {
+                    rows.push(std::mem::take(&mut row));
+                } else {
+                    row.clear();
+                }
+                saw_field = false;
+            }
+            '\r' => {}
+            _ => {
+                field.push(ch);
+                saw_field = true;
+            }
+        }
+    }
+
+    if in_quotes {
+        return Err(DbError::InvalidStatement(
+            "unterminated quoted field in csv".into(),
+        ));
+    }
+
+    if saw_field || !row.is_empty() {
+        row.push(field);
+        if row.iter().any(|value| !value.is_empty()) {
+            rows.push(row);
+        }
+    }
+
+    Ok(rows)
+}
+
+fn csv_value(column: &Column, raw: &str) -> Result<Value> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        if column.nullable {
+            return Ok(Value::Null);
+        }
+        return Err(DbError::ConstraintViolation(format!(
+            "column {} cannot be NULL",
+            column.name
+        )));
+    }
+
+    match column.data_type {
+        DataType::Int => {
+            trimmed
+                .parse::<i64>()
+                .map(Value::Int)
+                .map_err(|_| DbError::TypeMismatch {
+                    column: column.name.clone(),
+                    expected: "INT".into(),
+                    got: "TEXT".into(),
+                })
+        }
+        DataType::Text => Ok(Value::Text(trimmed.to_string())),
+        DataType::Bool => match trimmed.to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(Value::Bool(true)),
+            "false" | "0" => Ok(Value::Bool(false)),
+            _ => Err(DbError::TypeMismatch {
+                column: column.name.clone(),
+                expected: "BOOL".into(),
+                got: "TEXT".into(),
+            }),
+        },
+    }
+}
+
 fn analyze(db: &mut Database, table: Option<&str>) -> Result<QueryResult> {
     let table_names = if let Some(table) = table {
         let table = normalize_identifier(table);
@@ -402,17 +1117,27 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
     let plan = match statement {
         Statement::Select {
             table,
+            alias,
+            joins,
             projection,
             predicate,
+            group_by,
             order_by,
             limit,
+            offset,
         } => explain_select(
             db,
-            table,
-            projection,
-            predicate.as_ref(),
-            order_by.as_ref(),
-            *limit,
+            &SelectQuery {
+                table,
+                alias: alias.as_deref(),
+                joins,
+                projection,
+                predicate: predicate.as_ref(),
+                group_by,
+                order_by,
+                limit: *limit,
+                offset: *offset,
+            },
         )?,
         Statement::Insert { table, .. } => {
             format!("Insert\n  Table: {}", normalize_identifier(table))
@@ -443,54 +1168,107 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
                 describe_access_path(table_ref, predicate.as_ref(), db.stats.get(&table_name),)
             )
         }
+        Statement::CopyFrom { table, path } => {
+            format!(
+                "CopyFrom\n  Table: {}\n  Path: {path}",
+                normalize_identifier(table)
+            )
+        }
         other => format!("{other:?}"),
     };
 
     Ok(QueryResult::Plan { plan })
 }
 
-fn explain_select(
-    db: &Database,
-    table: &str,
-    projection: &Projection,
-    predicate: Option<&Predicate>,
-    order_by: Option<&OrderBy>,
-    limit: Option<usize>,
-) -> Result<String> {
-    let table_name = normalize_identifier(table);
-    let table = db
+fn explain_select(db: &Database, query: &SelectQuery<'_>) -> Result<String> {
+    let table_name = normalize_identifier(query.table);
+    let table_ref = db
         .tables
         .get(&table_name)
         .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-    let predicate = resolve_predicate(&table.schema, predicate)?;
-    let projection = match projection {
-        Projection::All => "*".into(),
-        Projection::Columns(columns) => columns.join(", "),
-        Projection::CountAll => "COUNT(*)".into(),
+    let projection = format_projection(query.projection);
+    let table_label = match query.alias {
+        Some(alias) => format!("{table_name} AS {alias}"),
+        None => table_name.clone(),
     };
     let mut lines = vec![
         "Select".to_string(),
-        format!("  Table: {table_name}"),
+        format!("  Table: {table_label}"),
         format!("  Projection: {projection}"),
-        format!(
-            "  Access: {}",
-            describe_access_path(table, predicate.as_ref(), db.stats.get(&table_name))
-        ),
     ];
 
-    if let Some(order_by) = order_by {
+    for join in query.joins {
+        let right_name = normalize_identifier(&join.table);
+        if !db.tables.contains_key(&right_name) {
+            return Err(DbError::TableNotFound(right_name));
+        }
+        let join_kind = match join.join_type {
+            JoinType::Inner => "INNER",
+            JoinType::Left => "LEFT",
+        };
+        let right_label = match &join.alias {
+            Some(alias) => format!("{right_name} AS {alias}"),
+            None => right_name,
+        };
         lines.push(format!(
-            "  Sort: {} {:?}",
-            normalize_identifier(&order_by.column),
-            order_by.direction
+            "  Join: nested loop join {join_kind} {right_label} ON {} = {}",
+            join.left, join.right
         ));
     }
 
-    if let Some(limit) = limit {
+    let access = if query.joins.is_empty() {
+        let predicate = resolve_predicate(&table_ref.schema, query.predicate)?;
+        describe_access_path(table_ref, predicate.as_ref(), db.stats.get(&table_name))
+    } else {
+        "nested loop join".into()
+    };
+    lines.push(format!("  Access: {access}"));
+
+    if !query.group_by.is_empty() {
+        lines.push(format!(
+            "  Aggregate: hash group by {}",
+            query.group_by.join(", ")
+        ));
+    } else if projection == "COUNT(*)" || projection.to_ascii_uppercase().contains("SUM(") {
+        lines.push("  Aggregate: hash aggregate".into());
+    }
+
+    if !query.order_by.is_empty() {
+        let keys = query
+            .order_by
+            .iter()
+            .map(|key| format!("{} {:?}", normalize_identifier(&key.column), key.direction))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("  Sort: {keys}"));
+    }
+
+    if let Some(offset) = query.offset {
+        lines.push(format!("  Offset: {offset}"));
+    }
+
+    if let Some(limit) = query.limit {
         lines.push(format!("  Limit: {limit}"));
     }
 
     Ok(lines.join("\n"))
+}
+
+fn format_projection(projection: &Projection) -> String {
+    match projection {
+        Projection::All => "*".into(),
+        Projection::Columns(columns) => columns.join(", "),
+        Projection::CountAll => "COUNT(*)".into(),
+        Projection::Items(items) => items
+            .iter()
+            .map(|item| match item {
+                SelectItem::Column(column) => column.clone(),
+                SelectItem::CountAll => "COUNT(*)".into(),
+                SelectItem::Sum(column) => format!("SUM({column})"),
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
 }
 
 fn describe_access_path(
@@ -544,32 +1322,6 @@ fn index_probe(predicate: Option<&BoundPredicate>) -> Option<(usize, Value)> {
     }
 }
 
-fn resolve_projection(
-    schema: &TableSchema,
-    projection: &Projection,
-) -> Result<(Vec<String>, Vec<usize>)> {
-    match projection {
-        Projection::All => Ok((
-            schema.column_names(),
-            (0..schema.columns.len()).collect::<Vec<_>>(),
-        )),
-        Projection::Columns(columns) => {
-            let mut names = Vec::new();
-            let mut indexes = Vec::new();
-
-            for column in columns {
-                let column = normalize_identifier(column);
-                let index = resolve_column(schema, &column)?;
-                names.push(column);
-                indexes.push(index);
-            }
-
-            Ok((names, indexes))
-        }
-        Projection::CountAll => Ok((vec!["count".into()], Vec::new())),
-    }
-}
-
 fn resolve_assignments(
     schema: &TableSchema,
     assignments: &[Assignment],
@@ -610,6 +1362,27 @@ fn resolve_predicate_inner(schema: &TableSchema, predicate: &Predicate) -> Resul
                 value: value.clone(),
             })
         }
+        Predicate::Like {
+            column,
+            pattern,
+            escape,
+        } => {
+            let column = normalize_identifier(column);
+            let index = resolve_column(schema, &column)?;
+            let data_type = &schema.columns[index].data_type;
+            if *data_type != DataType::Text {
+                return Err(DbError::TypeMismatch {
+                    column: column.clone(),
+                    expected: "TEXT".into(),
+                    got: data_type.to_string(),
+                });
+            }
+            Ok(BoundPredicate::Like {
+                column_index: index,
+                pattern: pattern.clone(),
+                escape: *escape,
+            })
+        }
         Predicate::And(left, right) => Ok(BoundPredicate::And(
             Box::new(resolve_predicate_inner(schema, left)?),
             Box::new(resolve_predicate_inner(schema, right)?),
@@ -621,11 +1394,88 @@ fn resolve_predicate_inner(schema: &TableSchema, predicate: &Predicate) -> Resul
     }
 }
 
+fn resolve_query_predicate(
+    schema: &QuerySchema,
+    predicate: Option<&Predicate>,
+) -> Result<Option<BoundPredicate>> {
+    let Some(predicate) = predicate else {
+        return Ok(None);
+    };
+    resolve_query_predicate_inner(schema, predicate).map(Some)
+}
+
+fn resolve_query_predicate_inner(
+    schema: &QuerySchema,
+    predicate: &Predicate,
+) -> Result<BoundPredicate> {
+    match predicate {
+        Predicate::Comparison { column, op, value } => {
+            let column = normalize_identifier(column);
+            let index = schema.resolve(&column)?;
+            validate_query_value(&schema.columns[index], value)?;
+            Ok(BoundPredicate::Comparison {
+                column_index: index,
+                column_name: column,
+                op: *op,
+                value: value.clone(),
+            })
+        }
+        Predicate::Like {
+            column,
+            pattern,
+            escape,
+        } => {
+            let column = normalize_identifier(column);
+            let index = schema.resolve(&column)?;
+            if schema.columns[index].data_type != DataType::Text {
+                return Err(DbError::TypeMismatch {
+                    column: column.clone(),
+                    expected: "TEXT".into(),
+                    got: schema.columns[index].data_type.to_string(),
+                });
+            }
+            Ok(BoundPredicate::Like {
+                column_index: index,
+                pattern: pattern.clone(),
+                escape: *escape,
+            })
+        }
+        Predicate::And(left, right) => Ok(BoundPredicate::And(
+            Box::new(resolve_query_predicate_inner(schema, left)?),
+            Box::new(resolve_query_predicate_inner(schema, right)?),
+        )),
+        Predicate::Or(left, right) => Ok(BoundPredicate::Or(
+            Box::new(resolve_query_predicate_inner(schema, left)?),
+            Box::new(resolve_query_predicate_inner(schema, right)?),
+        )),
+    }
+}
+
+fn validate_query_value(column: &QueryColumn, value: &Value) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    if !column.data_type.accepts(value) {
+        return Err(DbError::TypeMismatch {
+            column: column.name.clone(),
+            expected: column.data_type.to_string(),
+            got: value.type_name().to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn resolve_column(schema: &TableSchema, column: &str) -> Result<usize> {
     let column = normalize_identifier(column);
-    schema
-        .column_index(&column)
-        .ok_or(DbError::ColumnNotFound(column))
+    if let Some(index) = schema.column_index(&column) {
+        return Ok(index);
+    }
+    if let Some((_, name)) = column.split_once('.')
+        && let Some(index) = schema.column_index(name)
+    {
+        return Ok(index);
+    }
+    Err(DbError::ColumnNotFound(column))
 }
 
 fn matches_predicate(row: &Row, predicate: Option<&BoundPredicate>) -> bool {
@@ -636,6 +1486,14 @@ fn matches_predicate(row: &Row, predicate: Option<&BoundPredicate>) -> bool {
             value,
             ..
         }) => compare_values(&row[*column_index], *op, value),
+        Some(BoundPredicate::Like {
+            column_index,
+            pattern,
+            escape,
+        }) => match &row[*column_index] {
+            Value::Text(text) => like_matches(text, pattern, *escape),
+            _ => false,
+        },
         Some(BoundPredicate::And(left, right)) => {
             matches_predicate(row, Some(left)) && matches_predicate(row, Some(right))
         }
@@ -667,6 +1525,67 @@ fn compare_values(left: &Value, op: ComparisonOp, right: &Value) -> bool {
             .compare_same_type(right)
             .is_some_and(|ordering| matches!(ordering, Ordering::Greater | Ordering::Equal)),
     }
+}
+
+fn like_matches(text: &str, pattern: &str, escape: Option<char>) -> bool {
+    let text = text.chars().collect::<Vec<_>>();
+    let pattern = pattern.chars().collect::<Vec<_>>();
+    like_match_chars(&text, &pattern, escape)
+}
+
+fn like_match_chars(text: &[char], pattern: &[char], escape: Option<char>) -> bool {
+    let mut text_index = 0;
+    let mut pattern_index = 0;
+
+    while pattern_index < pattern.len() {
+        if escape == Some(pattern[pattern_index]) {
+            pattern_index += 1;
+            if pattern_index >= pattern.len() {
+                return false;
+            }
+            if text_index >= text.len() || text[text_index] != pattern[pattern_index] {
+                return false;
+            }
+            text_index += 1;
+            pattern_index += 1;
+            continue;
+        }
+
+        match pattern[pattern_index] {
+            '%' => {
+                pattern_index += 1;
+                if pattern_index == pattern.len() {
+                    return true;
+                }
+                while text_index <= text.len() {
+                    if like_match_chars(&text[text_index..], &pattern[pattern_index..], escape) {
+                        return true;
+                    }
+                    if text_index == text.len() {
+                        break;
+                    }
+                    text_index += 1;
+                }
+                return false;
+            }
+            '_' => {
+                if text_index >= text.len() {
+                    return false;
+                }
+                text_index += 1;
+                pattern_index += 1;
+            }
+            ch => {
+                if text_index >= text.len() || text[text_index] != ch {
+                    return false;
+                }
+                text_index += 1;
+                pattern_index += 1;
+            }
+        }
+    }
+
+    text_index == text.len()
 }
 
 fn format_rows(columns: &[String], rows: &[Row]) -> String {
