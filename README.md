@@ -1,5 +1,7 @@
 # Relational Database From Scratch
 
+**Live SQL playground:** [https://sebby1770.github.io/relational-db-from-scratch/](https://sebby1770.github.io/relational-db-from-scratch/)
+
 An educational, SQLite-inspired relational database built in Rust.
 
 See [CHANGELOG.md](CHANGELOG.md) for release history.

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Relational DB from Scratch</title>
+    <meta name="description" content="Educational SQL playground for the Rust database — JOIN, GROUP BY, UNION, EXCEPT, and more.">
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">relational-db-from-scratch <span>0.6</span></div>
+      <div class="top-actions">
+        <button class="btn ghost" id="btn-reset">Reset demo</button>
+        <a class="btn ghost" href="https://github.com/Sebby1770/relational-db-from-scratch">GitHub</a>
+      </div>
+    </header>
+    <main class="layout">
+      <aside class="sidebar">
+        <h2>Catalog</h2>
+        <pre id="schema"> </pre>
+        <h2>Examples</h2>
+        <div id="examples" class="examples"></div>
+      </aside>
+      <section class="workspace">
+        <label class="sql-label" for="sql">SQL</label>
+        <textarea id="sql" spellcheck="false">SELECT users.name, orders.total
+FROM users
+JOIN orders ON users.id = orders.user_id
+WHERE orders.total > 100
+ORDER BY orders.total DESC;</textarea>
+        <div class="row">
+          <button class="btn primary" id="btn-run">Run</button>
+          <button class="btn" id="btn-explain">EXPLAIN</button>
+        </div>
+        <p class="status" id="status">Ready.</p>
+        <div id="result" class="result"></div>
+      </section>
+    </main>
+    <script src="./engine.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>
