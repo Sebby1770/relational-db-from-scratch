@@ -1,6 +1,6 @@
 [package]
 name = "relational-db-from-scratch"
-version = "0.2.0"
+version = "0.6.0"
 edition = "2024"
 description = "An educational SQLite-inspired relational database built from scratch in Rust."
 readme = "README.md"

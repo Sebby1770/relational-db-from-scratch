@@ -7,6 +7,12 @@ pub enum Statement {
     CreateTable {
         name: String,
         columns: Vec<Column>,
+        if_not_exists: bool,
+    },
+    CreateTableAs {
+        name: String,
+        query: Box<SelectStatement>,
+        if_not_exists: bool,
     },
     CreateIndex {
         name: String,
@@ -16,21 +22,19 @@ pub enum Statement {
     },
     DropTable {
         name: String,
+        if_exists: bool,
+    },
+    Truncate {
+        table: String,
     },
     DropIndex {
         name: String,
     },
     Insert {
         table: String,
-        values: Vec<Value>,
+        source: InsertSource,
     },
-    Select {
-        table: String,
-        projection: Projection,
-        predicate: Option<Predicate>,
-        order_by: Option<OrderBy>,
-        limit: Option<usize>,
-    },
+    Select(Box<SelectStatement>),
     Update {
         table: String,
         assignments: Vec<Assignment>,
@@ -39,6 +43,18 @@ pub enum Statement {
     Delete {
         table: String,
         predicate: Option<Predicate>,
+    },
+    CopyFrom {
+        table: String,
+        path: String,
+    },
+    CopyTo {
+        table: String,
+        path: String,
+    },
+    AlterTable {
+        table: String,
+        action: AlterAction,
     },
     Explain(Box<Statement>),
     Begin,
@@ -55,14 +71,128 @@ pub enum Projection {
     All,
     Columns(Vec<String>),
     CountAll,
+    Items(Vec<SelectItem>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertSource {
+    Values(Vec<Vec<Value>>),
+    Select(Box<SelectStatement>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterAction {
+    AddColumn { column: Column },
+    RenameTable { new_name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectStatement {
+    pub distinct: bool,
+    pub table: String,
+    pub alias: Option<String>,
+    pub joins: Vec<JoinClause>,
+    pub projection: Projection,
+    pub predicate: Option<Predicate>,
+    pub group_by: Vec<String>,
+    pub having: Option<Predicate>,
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub unions: Vec<UnionPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionPart {
+    pub op: SetOp,
+    pub all: bool,
+    pub query: SelectStatement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    Except,
+    Intersect,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectItem {
+    Column(String),
+    CountAll,
+    Count(String),
+    Sum(String),
+    Min(String),
+    Max(String),
+    Avg(String),
+    Case {
+        when: Box<Predicate>,
+        then_value: Value,
+        else_value: Value,
+    },
+    Coalesce {
+        column: String,
+        fallback: Value,
+    },
+}
+
+impl SelectItem {
+    pub fn is_aggregate(&self) -> bool {
+        matches!(
+            self,
+            SelectItem::CountAll
+                | SelectItem::Count(_)
+                | SelectItem::Sum(_)
+                | SelectItem::Min(_)
+                | SelectItem::Max(_)
+                | SelectItem::Avg(_)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinClause {
+    pub join_type: JoinType,
+    pub table: String,
+    pub alias: Option<String>,
+    pub left: String,
+    pub right: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+    Cross,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Predicate {
     Comparison {
-        column: String,
+        expr: SelectItem,
         op: ComparisonOp,
         value: Value,
+    },
+    Between {
+        expr: SelectItem,
+        low: Value,
+        high: Value,
+        negated: bool,
+    },
+    InList {
+        expr: SelectItem,
+        values: Vec<Value>,
+        negated: bool,
+    },
+    IsNull {
+        expr: SelectItem,
+        negated: bool,
+    },
+    Like {
+        column: String,
+        pattern: String,
+        escape: Option<char>,
     },
     And(Box<Predicate>, Box<Predicate>),
     Or(Box<Predicate>, Box<Predicate>),
@@ -105,6 +235,7 @@ enum Token {
     LParen,
     RParen,
     Star,
+    Dot,
     Eq,
     Ne,
     Lt,
@@ -207,6 +338,10 @@ fn tokenize(sql: &str) -> Result<Vec<Token>> {
                 tokens.push(Token::Star);
                 index += 1;
             }
+            '.' => {
+                tokens.push(Token::Dot);
+                index += 1;
+            }
             '=' => {
                 tokens.push(Token::Eq);
                 index += 1;
@@ -264,6 +399,44 @@ fn is_ident_continue(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
 }
 
+fn is_reserved_after_table(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        "WHERE"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "CROSS"
+            | "OUTER"
+            | "ON"
+            | "GROUP"
+            | "ORDER"
+            | "LIMIT"
+            | "OFFSET"
+            | "HAVING"
+            | "UNION"
+            | "EXCEPT"
+            | "INTERSECT"
+            | "AS"
+            | "DISTINCT"
+            | "BETWEEN"
+            | "IN"
+            | "NOT"
+            | "IS"
+            | "NULL"
+            | "CASE"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+            | "ALL"
+            | "ALTER"
+            | "ADD"
+    )
+}
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
@@ -301,6 +474,21 @@ impl Parser {
             return Ok(Statement::Checkpoint);
         }
 
+        if self.consume_keyword("COPY") {
+            return self.parse_copy();
+        }
+
+        if self.consume_keyword("ALTER") {
+            return self.parse_alter();
+        }
+
+        if self.consume_keyword("TRUNCATE") {
+            let _ = self.consume_keyword("TABLE");
+            return Ok(Statement::Truncate {
+                table: self.expect_ident()?,
+            });
+        }
+
         if self.consume_keyword("DROP") {
             return self.parse_drop();
         }
@@ -330,8 +518,10 @@ impl Parser {
 
     fn parse_drop(&mut self) -> Result<Statement> {
         if self.consume_keyword("TABLE") {
+            let if_exists = self.consume_if_exists();
             return Ok(Statement::DropTable {
                 name: self.expect_ident()?,
+                if_exists,
             });
         }
 
@@ -367,7 +557,16 @@ impl Parser {
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
+        let if_not_exists = self.consume_if_not_exists();
         let name = self.expect_ident()?;
+        if self.consume_keyword("AS") {
+            self.expect_keyword("SELECT")?;
+            return Ok(Statement::CreateTableAs {
+                name,
+                query: Box::new(self.parse_select_statement()?),
+                if_not_exists,
+            });
+        }
         self.expect(Token::LParen)?;
 
         let mut columns = Vec::new();
@@ -400,7 +599,11 @@ impl Parser {
         }
 
         self.expect(Token::RParen)?;
-        Ok(Statement::CreateTable { name, columns })
+        Ok(Statement::CreateTable {
+            name,
+            columns,
+            if_not_exists,
+        })
     }
 
     fn parse_create_index(&mut self, unique: bool) -> Result<Statement> {
@@ -422,36 +625,156 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_ident()?;
+
+        if self.consume_keyword("SELECT") {
+            return Ok(Statement::Insert {
+                table,
+                source: InsertSource::Select(Box::new(self.parse_select_statement()?)),
+            });
+        }
+
         self.expect_keyword("VALUES")?;
-        self.expect(Token::LParen)?;
-
-        let mut values = Vec::new();
+        let mut rows = Vec::new();
         loop {
-            values.push(self.parse_literal()?);
-
+            self.expect(Token::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                values.push(self.parse_literal()?);
+                if !self.consume(Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(Token::RParen)?;
+            rows.push(values);
             if !self.consume(Token::Comma) {
                 break;
             }
         }
+        Ok(Statement::Insert {
+            table,
+            source: InsertSource::Values(rows),
+        })
+    }
 
-        self.expect(Token::RParen)?;
-        Ok(Statement::Insert { table, values })
+    fn parse_copy(&mut self) -> Result<Statement> {
+        let table = self.expect_ident()?;
+        if self.consume_keyword("FROM") {
+            return Ok(Statement::CopyFrom {
+                table,
+                path: self.expect_csv_path()?,
+            });
+        }
+        if self.consume_keyword("TO") {
+            return Ok(Statement::CopyTo {
+                table,
+                path: self.expect_csv_path()?,
+            });
+        }
+        Err(DbError::Parse(
+            "expected FROM or TO after COPY table".into(),
+        ))
+    }
+
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_ident()?;
+        if self.consume_keyword("RENAME") {
+            self.expect_keyword("TO")?;
+            return Ok(Statement::AlterTable {
+                table,
+                action: AlterAction::RenameTable {
+                    new_name: self.expect_ident()?,
+                },
+            });
+        }
+        self.expect_keyword("ADD")?;
+        self.expect_keyword("COLUMN")?;
+        let column_name = self.expect_ident()?;
+        let data_type = self.parse_data_type()?;
+        if self.consume_keyword("NOT") {
+            return Err(DbError::Parse(
+                "ALTER TABLE ADD COLUMN does not support NOT NULL".into(),
+            ));
+        }
+        let _ = self.consume_keyword("NULL");
+        Ok(Statement::AlterTable {
+            table,
+            action: AlterAction::AddColumn {
+                column: Column::new(column_name, data_type),
+            },
+        })
+    }
+
+    fn expect_csv_path(&mut self) -> Result<String> {
+        match self.advance() {
+            Some(Token::String(path)) => Ok(path),
+            Some(other) => Err(DbError::Parse(format!(
+                "expected csv path string, got {other:?}"
+            ))),
+            None => Err(DbError::Parse("expected csv path string".into())),
+        }
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
+        Ok(Statement::Select(Box::new(self.parse_select_statement()?)))
+    }
+
+    fn parse_select_statement(&mut self) -> Result<SelectStatement> {
+        let mut query = self.parse_select_core()?;
+        loop {
+            let op = if self.consume_keyword("UNION") {
+                SetOp::Union
+            } else if self.consume_keyword("EXCEPT") {
+                SetOp::Except
+            } else if self.consume_keyword("INTERSECT") {
+                SetOp::Intersect
+            } else {
+                break;
+            };
+            let all = self.consume_keyword("ALL");
+            if all && op != SetOp::Union {
+                return Err(DbError::Parse(
+                    "EXCEPT ALL and INTERSECT ALL are not supported".into(),
+                ));
+            }
+            self.expect_keyword("SELECT")?;
+            let right = self.parse_select_core()?;
+            query.unions.push(UnionPart {
+                op,
+                all,
+                query: right,
+            });
+        }
+        query.order_by = self.parse_order_by_list()?;
+        let (limit, offset) = self.parse_optional_limit_offset()?;
+        query.limit = limit;
+        query.offset = offset;
+        Ok(query)
+    }
+
+    fn parse_select_core(&mut self) -> Result<SelectStatement> {
+        let distinct = self.consume_keyword("DISTINCT");
         let projection = self.parse_projection()?;
         self.expect_keyword("FROM")?;
-        let table = self.expect_ident()?;
+        let (table, alias) = self.parse_table_ref()?;
+        let joins = self.parse_joins()?;
         let predicate = self.parse_optional_predicate()?;
-        let order_by = self.parse_optional_order_by()?;
-        let limit = self.parse_optional_limit()?;
+        let group_by = self.parse_optional_group_by()?;
+        let having = self.parse_optional_having()?;
 
-        Ok(Statement::Select {
+        Ok(SelectStatement {
+            distinct,
             table,
+            alias,
+            joins,
             projection,
             predicate,
-            order_by,
-            limit,
+            group_by,
+            having,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
         })
     }
 
@@ -460,23 +783,174 @@ impl Parser {
             return Ok(Projection::All);
         }
 
-        if self.consume_keyword("COUNT") {
-            self.expect(Token::LParen)?;
-            self.expect(Token::Star)?;
-            self.expect(Token::RParen)?;
-            return Ok(Projection::CountAll);
-        }
-
-        let mut columns = Vec::new();
+        let mut items = Vec::new();
         loop {
-            columns.push(self.expect_ident()?);
-
+            items.push(self.parse_select_item()?);
             if !self.consume(Token::Comma) {
                 break;
             }
         }
 
-        Ok(Projection::Columns(columns))
+        if items.len() == 1 && matches!(items[0], SelectItem::CountAll) {
+            return Ok(Projection::CountAll);
+        }
+
+        if items
+            .iter()
+            .all(|item| matches!(item, SelectItem::Column(_)))
+        {
+            let columns = items
+                .into_iter()
+                .map(|item| match item {
+                    SelectItem::Column(column) => column,
+                    _ => unreachable!("filtered to columns"),
+                })
+                .collect();
+            return Ok(Projection::Columns(columns));
+        }
+
+        Ok(Projection::Items(items))
+    }
+
+    fn parse_select_item(&mut self) -> Result<SelectItem> {
+        if self.consume_keyword("CASE") {
+            return self.parse_case();
+        }
+
+        if self.peek_function("COUNT") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            if self.consume(Token::Star) {
+                self.expect(Token::RParen)?;
+                return Ok(SelectItem::CountAll);
+            }
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Count(column));
+        }
+
+        if self.peek_function("SUM") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Sum(column));
+        }
+
+        if self.peek_function("MIN") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Min(column));
+        }
+
+        if self.peek_function("MAX") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Max(column));
+        }
+
+        if self.peek_function("AVG") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Avg(column));
+        }
+
+        if self.peek_function("COALESCE") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::Comma)?;
+            let fallback = self.parse_literal()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Coalesce { column, fallback });
+        }
+
+        Ok(SelectItem::Column(self.parse_column_ref()?))
+    }
+
+    fn parse_case(&mut self) -> Result<SelectItem> {
+        self.expect_keyword("WHEN")?;
+        let when = self.parse_or()?;
+        self.expect_keyword("THEN")?;
+        let then_value = self.parse_literal()?;
+        self.expect_keyword("ELSE")?;
+        let else_value = self.parse_literal()?;
+        self.expect_keyword("END")?;
+        Ok(SelectItem::Case {
+            when: Box::new(when),
+            then_value,
+            else_value,
+        })
+    }
+
+    fn parse_table_ref(&mut self) -> Result<(String, Option<String>)> {
+        let table = self.expect_ident()?;
+        if self.consume_keyword("AS") {
+            return Ok((table, Some(self.expect_ident()?)));
+        }
+        if self.next_is_table_alias() {
+            return Ok((table, Some(self.expect_ident()?)));
+        }
+        Ok((table, None))
+    }
+
+    fn next_is_table_alias(&self) -> bool {
+        match self.peek() {
+            Some(Token::Ident(value)) => !is_reserved_after_table(value),
+            _ => false,
+        }
+    }
+
+    fn parse_joins(&mut self) -> Result<Vec<JoinClause>> {
+        let mut joins = Vec::new();
+
+        loop {
+            let join_type = if self.consume_keyword("INNER") {
+                self.expect_keyword("JOIN")?;
+                JoinType::Inner
+            } else if self.consume_keyword("LEFT") {
+                let _ = self.consume_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinType::Left
+            } else if self.consume_keyword("RIGHT") {
+                let _ = self.consume_keyword("OUTER");
+                self.expect_keyword("JOIN")?;
+                JoinType::Right
+            } else if self.consume_keyword("CROSS") {
+                self.expect_keyword("JOIN")?;
+                JoinType::Cross
+            } else if self.consume_keyword("JOIN") {
+                JoinType::Inner
+            } else {
+                break;
+            };
+
+            let (table, alias) = self.parse_table_ref()?;
+            let (left, right) = if join_type == JoinType::Cross {
+                (String::new(), String::new())
+            } else {
+                self.expect_keyword("ON")?;
+                let left = self.parse_column_ref()?;
+                self.expect(Token::Eq)?;
+                let right = self.parse_column_ref()?;
+                (left, right)
+            };
+            joins.push(JoinClause {
+                join_type,
+                table,
+                alias,
+                left,
+                right,
+            });
+        }
+
+        Ok(joins)
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
@@ -548,10 +1022,117 @@ impl Parser {
             return Ok(predicate);
         }
 
-        let column = self.expect_ident()?;
+        let expr = self.parse_select_item()?;
+        if self.consume_keyword("NOT") {
+            if self.consume_keyword("BETWEEN") {
+                return self.parse_between(expr, true);
+            }
+            if self.consume_keyword("IN") {
+                return self.parse_in_list(expr, true);
+            }
+            return Err(DbError::Parse("expected BETWEEN or IN after NOT".into()));
+        }
+
+        if self.consume_keyword("BETWEEN") {
+            return self.parse_between(expr, false);
+        }
+
+        if self.consume_keyword("IN") {
+            return self.parse_in_list(expr, false);
+        }
+
+        if self.consume_keyword("LIKE") {
+            let SelectItem::Column(column) = expr else {
+                return Err(DbError::Parse(
+                    "LIKE requires a column on the left-hand side".into(),
+                ));
+            };
+            return self.parse_like(column);
+        }
+
+        if self.consume_keyword("IS") {
+            let negated = self.consume_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            return Ok(Predicate::IsNull { expr, negated });
+        }
+
         let op = self.parse_comparison_op()?;
         let value = self.parse_literal()?;
-        Ok(Predicate::Comparison { column, op, value })
+        Ok(Predicate::Comparison { expr, op, value })
+    }
+
+    fn parse_between(&mut self, expr: SelectItem, negated: bool) -> Result<Predicate> {
+        let low = self.parse_literal()?;
+        self.expect_keyword("AND")?;
+        let high = self.parse_literal()?;
+        Ok(Predicate::Between {
+            expr,
+            low,
+            high,
+            negated,
+        })
+    }
+
+    fn parse_in_list(&mut self, expr: SelectItem, negated: bool) -> Result<Predicate> {
+        self.expect(Token::LParen)?;
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_literal()?);
+            if !self.consume(Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::RParen)?;
+        if values.is_empty() {
+            return Err(DbError::Parse("expected value in IN list".into()));
+        }
+        Ok(Predicate::InList {
+            expr,
+            values,
+            negated,
+        })
+    }
+
+    fn parse_like(&mut self, column: String) -> Result<Predicate> {
+        let pattern = match self.advance() {
+            Some(Token::String(pattern)) => pattern,
+            Some(other) => {
+                return Err(DbError::Parse(format!(
+                    "expected LIKE pattern string, got {other:?}"
+                )));
+            }
+            None => return Err(DbError::Parse("expected LIKE pattern string".into())),
+        };
+
+        let escape = if self.consume_keyword("ESCAPE") {
+            match self.advance() {
+                Some(Token::String(value)) => {
+                    let mut chars = value.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(escape), None) => Some(escape),
+                        _ => {
+                            return Err(DbError::Parse(
+                                "ESCAPE clause must be a single character".into(),
+                            ));
+                        }
+                    }
+                }
+                Some(other) => {
+                    return Err(DbError::Parse(format!(
+                        "expected ESCAPE character string, got {other:?}"
+                    )));
+                }
+                None => return Err(DbError::Parse("expected ESCAPE character string".into())),
+            }
+        } else {
+            None
+        };
+
+        Ok(Predicate::Like {
+            column,
+            pattern,
+            escape,
+        })
     }
 
     fn parse_comparison_op(&mut self) -> Result<ComparisonOp> {
@@ -571,39 +1152,102 @@ impl Parser {
         }
     }
 
-    fn parse_optional_order_by(&mut self) -> Result<Option<OrderBy>> {
-        if !self.consume_keyword("ORDER") {
-            return Ok(None);
+    fn parse_optional_group_by(&mut self) -> Result<Vec<String>> {
+        if !self.consume_keyword("GROUP") {
+            return Ok(Vec::new());
         }
 
         self.expect_keyword("BY")?;
-        let column = self.expect_ident()?;
-        let direction = if self.consume_keyword("DESC") {
-            SortDirection::Desc
-        } else {
-            let _ = self.consume_keyword("ASC");
-            SortDirection::Asc
-        };
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.parse_column_ref()?);
+            if !self.consume(Token::Comma) {
+                break;
+            }
+        }
 
-        Ok(Some(OrderBy { column, direction }))
+        if columns.is_empty() {
+            return Err(DbError::Parse("expected column after GROUP BY".into()));
+        }
+
+        Ok(columns)
     }
 
-    fn parse_optional_limit(&mut self) -> Result<Option<usize>> {
-        if !self.consume_keyword("LIMIT") {
+    fn parse_optional_having(&mut self) -> Result<Option<Predicate>> {
+        if !self.consume_keyword("HAVING") {
             return Ok(None);
         }
 
-        let limit = match self.advance() {
-            Some(Token::Number(value)) if value >= 0 => value as usize,
-            Some(other) => {
-                return Err(DbError::Parse(format!(
-                    "expected non-negative LIMIT literal, got {other:?}"
-                )));
+        self.parse_or().map(Some)
+    }
+
+    fn parse_order_by_list(&mut self) -> Result<Vec<OrderBy>> {
+        if !self.consume_keyword("ORDER") {
+            return Ok(Vec::new());
+        }
+
+        self.expect_keyword("BY")?;
+        let mut keys = Vec::new();
+        loop {
+            let column = if let Some(Token::Number(value)) = self.peek() {
+                if *value <= 0 {
+                    return Err(DbError::Parse(
+                        "ORDER BY position must be a positive integer".into(),
+                    ));
+                }
+                let value = *value;
+                self.advance();
+                value.to_string()
+            } else {
+                self.parse_column_ref()?
+            };
+            let direction = if self.consume_keyword("DESC") {
+                SortDirection::Desc
+            } else {
+                let _ = self.consume_keyword("ASC");
+                SortDirection::Asc
+            };
+            keys.push(OrderBy { column, direction });
+            if !self.consume(Token::Comma) {
+                break;
             }
-            None => return Err(DbError::Parse("expected LIMIT literal".into())),
+        }
+
+        if keys.is_empty() {
+            return Err(DbError::Parse("expected column after ORDER BY".into()));
+        }
+
+        Ok(keys)
+    }
+
+    fn parse_optional_limit_offset(&mut self) -> Result<(Option<usize>, Option<usize>)> {
+        if self.consume_keyword("OFFSET") {
+            let offset = self.expect_non_negative_int("OFFSET")?;
+            return Ok((None, Some(offset)));
+        }
+
+        if !self.consume_keyword("LIMIT") {
+            return Ok((None, None));
+        }
+
+        let limit = self.expect_non_negative_int("LIMIT")?;
+        let offset = if self.consume_keyword("OFFSET") {
+            Some(self.expect_non_negative_int("OFFSET")?)
+        } else {
+            None
         };
 
-        Ok(Some(limit))
+        Ok((Some(limit), offset))
+    }
+
+    fn expect_non_negative_int(&mut self, label: &str) -> Result<usize> {
+        match self.advance() {
+            Some(Token::Number(value)) if value >= 0 => Ok(value as usize),
+            Some(other) => Err(DbError::Parse(format!(
+                "expected non-negative {label} literal, got {other:?}"
+            ))),
+            None => Err(DbError::Parse(format!("expected {label} literal"))),
+        }
     }
 
     fn parse_data_type(&mut self) -> Result<DataType> {
@@ -633,6 +1277,16 @@ impl Parser {
         }
     }
 
+    fn parse_column_ref(&mut self) -> Result<String> {
+        let first = self.expect_ident()?;
+        if self.consume(Token::Dot) {
+            let second = self.expect_ident()?;
+            Ok(format!("{first}.{second}"))
+        } else {
+            Ok(first)
+        }
+    }
+
     fn expect_ident(&mut self) -> Result<String> {
         match self.advance() {
             Some(Token::Ident(value)) => Ok(normalize_identifier(&value)),
@@ -653,12 +1307,30 @@ impl Parser {
         Err(DbError::Parse(format!("expected keyword {keyword}")))
     }
 
+    fn consume_if_not_exists(&mut self) -> bool {
+        self.consume_keyword("IF") && self.consume_keyword("NOT") && self.consume_keyword("EXISTS")
+    }
+
+    fn consume_if_exists(&mut self) -> bool {
+        if self.consume_keyword("IF") {
+            return self.consume_keyword("EXISTS");
+        }
+        false
+    }
+
     fn consume_keyword(&mut self, keyword: &str) -> bool {
         match self.peek() {
             Some(Token::Ident(value)) if value.eq_ignore_ascii_case(keyword) => {
                 self.pos += 1;
                 true
             }
+            _ => false,
+        }
+    }
+
+    fn peek_function(&self, name: &str) -> bool {
+        match (self.peek(), self.tokens.get(self.pos + 1)) {
+            (Some(Token::Ident(ident)), Some(Token::LParen)) => ident.eq_ignore_ascii_case(name),
             _ => false,
         }
     }

@@ -1,5 +1,6 @@
 use relational_db_from_scratch::parser::{
-    ComparisonOp, Predicate, Projection, Statement, parse_sql,
+    ComparisonOp, InsertSource, JoinType, Predicate, Projection, SelectItem, SetOp, Statement,
+    parse_sql,
 };
 
 #[test]
@@ -18,15 +19,10 @@ fn parses_select_with_order_and_limit() {
             .unwrap();
 
     match statement {
-        Statement::Select {
-            projection,
-            order_by,
-            limit,
-            ..
-        } => {
-            assert!(matches!(projection, Projection::Columns(_)));
-            assert!(order_by.is_some());
-            assert_eq!(limit, Some(5));
+        Statement::Select(query) => {
+            assert!(matches!(query.projection, Projection::Columns(_)));
+            assert!(!query.order_by.is_empty());
+            assert_eq!(query.limit, Some(5));
         }
         other => panic!("unexpected statement: {other:?}"),
     }
@@ -36,11 +32,8 @@ fn parses_select_with_order_and_limit() {
 fn parses_predicate_precedence() {
     let statement = parse_sql("SELECT id FROM users WHERE a = 1 AND b = 2 OR c = 3;").unwrap();
     match statement {
-        Statement::Select {
-            predicate: Some(pred),
-            ..
-        } => match pred {
-            Predicate::Or(left, right) => {
+        Statement::Select(query) => match query.predicate {
+            Some(Predicate::Or(left, right)) => {
                 assert!(matches!(*left, Predicate::And(_, _)));
                 assert!(matches!(*right, Predicate::Comparison { .. }));
             }
@@ -73,12 +66,205 @@ fn rejects_unterminated_string_literals() {
 fn parses_comparison_operators() {
     let statement = parse_sql("SELECT id FROM scores WHERE points >= 20;").unwrap();
     match statement {
-        Statement::Select {
-            predicate: Some(Predicate::Comparison { op, .. }),
-            ..
-        } => {
-            assert_eq!(op, ComparisonOp::Gte);
+        Statement::Select(query) => match query.predicate {
+            Some(Predicate::Comparison { op, .. }) => {
+                assert_eq!(op, ComparisonOp::Gte);
+            }
+            other => panic!("unexpected predicate: {other:?}"),
+        },
+        other => panic!("unexpected statement: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_join_group_like_offset_and_copy() {
+    let join = parse_sql(
+        "SELECT users.name, orders.total FROM users JOIN orders ON users.id = orders.user_id;",
+    )
+    .unwrap();
+    match join {
+        Statement::Select(query) => {
+            assert_eq!(query.joins.len(), 1);
+            assert_eq!(query.joins[0].join_type, JoinType::Inner);
+            assert_eq!(query.joins[0].left, "users.id");
+            assert_eq!(query.joins[0].right, "orders.user_id");
+            assert_eq!(query.offset, None);
         }
         other => panic!("unexpected statement: {other:?}"),
     }
+
+    let grouped = parse_sql("SELECT dept, COUNT(*), SUM(n) FROM emp GROUP BY dept;").unwrap();
+    match grouped {
+        Statement::Select(query) => match query.projection {
+            Projection::Items(items) => {
+                assert!(matches!(items[0], SelectItem::Column(_)));
+                assert!(matches!(items[1], SelectItem::CountAll));
+                assert!(matches!(items[2], SelectItem::Sum(_)));
+                assert_eq!(query.group_by, vec!["dept"]);
+            }
+            other => panic!("unexpected projection: {other:?}"),
+        },
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let like = parse_sql("SELECT word FROM words WHERE word LIKE 'foo%';").unwrap();
+    assert!(matches!(
+        like,
+        Statement::Select(query) if matches!(query.predicate, Some(Predicate::Like { .. }))
+    ));
+
+    let limited = parse_sql("SELECT id FROM users ORDER BY id LIMIT 10 OFFSET 5;").unwrap();
+    match limited {
+        Statement::Select(query) => {
+            assert_eq!(query.limit, Some(10));
+            assert_eq!(query.offset, Some(5));
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    assert!(matches!(
+        parse_sql("COPY users FROM 'users.csv';").unwrap(),
+        Statement::CopyFrom { .. }
+    ));
+
+    let left =
+        parse_sql("SELECT * FROM users LEFT JOIN orders ON users.id = orders.user_id;").unwrap();
+    match left {
+        Statement::Select(query) => {
+            assert_eq!(query.joins[0].join_type, JoinType::Left);
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_having_distinct_insert_select_and_richer_predicates() {
+    let having =
+        parse_sql("SELECT dept, COUNT(*) FROM emp GROUP BY dept HAVING COUNT(*) > 1;").unwrap();
+    match having {
+        Statement::Select(query) => {
+            assert_eq!(query.group_by, vec!["dept"]);
+            assert!(!query.distinct);
+            match query.having {
+                Some(Predicate::Comparison { expr, op, .. }) => {
+                    assert!(matches!(expr, SelectItem::CountAll));
+                    assert_eq!(op, ComparisonOp::Gt);
+                }
+                other => panic!("unexpected having: {other:?}"),
+            }
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let distinct = parse_sql("SELECT DISTINCT dept, n FROM emp;").unwrap();
+    match distinct {
+        Statement::Select(query) => assert!(query.distinct),
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let insert_select =
+        parse_sql("INSERT INTO dest SELECT id, name FROM src WHERE id IN (1, 2);").unwrap();
+    match insert_select {
+        Statement::Insert {
+            table,
+            source: InsertSource::Select(query),
+        } => {
+            assert_eq!(table, "dest");
+            match query.predicate {
+                Some(Predicate::InList { values, .. }) => {
+                    assert_eq!(values.len(), 2);
+                }
+                other => panic!("unexpected source select predicate: {other:?}"),
+            }
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let between = parse_sql("SELECT id FROM scores WHERE points BETWEEN 10 AND 20;").unwrap();
+    assert!(matches!(
+        between,
+        Statement::Select(query) if matches!(query.predicate, Some(Predicate::Between { .. }))
+    ));
+
+    let aggs = parse_sql("SELECT MIN(n), MAX(n), AVG(n) FROM emp;").unwrap();
+    match aggs {
+        Statement::Select(query) => match query.projection {
+            Projection::Items(items) => {
+                assert!(matches!(items[0], SelectItem::Min(_)));
+                assert!(matches!(items[1], SelectItem::Max(_)));
+                assert!(matches!(items[2], SelectItem::Avg(_)));
+            }
+            other => panic!("unexpected projection: {other:?}"),
+        },
+        other => panic!("unexpected statement: {other:?}"),
+    }
+}
+
+#[test]
+fn parses_v05_sql_surface() {
+    let is_null = parse_sql("SELECT id FROM items WHERE label IS NULL;").unwrap();
+    assert!(matches!(
+        is_null,
+        Statement::Select(query) if matches!(query.predicate, Some(Predicate::IsNull { negated: false, .. }))
+    ));
+
+    let is_not_null = parse_sql("SELECT id FROM items WHERE label IS NOT NULL;").unwrap();
+    assert!(matches!(
+        is_not_null,
+        Statement::Select(query) if matches!(query.predicate, Some(Predicate::IsNull { negated: true, .. }))
+    ));
+
+    let not_in = parse_sql("SELECT id FROM scores WHERE id NOT IN (1, 2);").unwrap();
+    assert!(matches!(
+        not_in,
+        Statement::Select(query)
+            if matches!(query.predicate, Some(Predicate::InList { negated: true, .. }))
+    ));
+
+    let not_between = parse_sql("SELECT id FROM scores WHERE points NOT BETWEEN 1 AND 5;").unwrap();
+    assert!(matches!(
+        not_between,
+        Statement::Select(query)
+            if matches!(query.predicate, Some(Predicate::Between { negated: true, .. }))
+    ));
+
+    let count_col = parse_sql("SELECT COUNT(label) FROM items;").unwrap();
+    match count_col {
+        Statement::Select(query) => match query.projection {
+            Projection::Items(items) => assert!(matches!(items[0], SelectItem::Count(_))),
+            other => panic!("unexpected projection: {other:?}"),
+        },
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let unioned =
+        parse_sql("SELECT n FROM left_t UNION ALL SELECT n FROM right_t ORDER BY n;").unwrap();
+    match unioned {
+        Statement::Select(query) => {
+            assert_eq!(query.unions.len(), 1);
+            assert!(query.unions[0].all);
+            assert_eq!(query.unions[0].op, SetOp::Union);
+            assert_eq!(query.order_by.len(), 1);
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let case_when =
+        parse_sql("SELECT CASE WHEN n >= 10 THEN 'big' ELSE 'small' END FROM emp;").unwrap();
+    match case_when {
+        Statement::Select(query) => match query.projection {
+            Projection::Items(items) => assert!(matches!(items[0], SelectItem::Case { .. })),
+            other => panic!("unexpected projection: {other:?}"),
+        },
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    assert!(matches!(
+        parse_sql("ALTER TABLE users ADD COLUMN active BOOL;").unwrap(),
+        Statement::AlterTable { .. }
+    ));
+    assert!(matches!(
+        parse_sql("COPY users TO 'users.csv';").unwrap(),
+        Statement::CopyTo { .. }
+    ));
 }

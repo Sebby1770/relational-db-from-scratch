@@ -5,8 +5,7 @@ use relational_db_from_scratch::Database;
 
 fn main() -> io::Result<()> {
     let mut db = match env::args().nth(1) {
-        Some(path) => Database::open(path)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))?,
+        Some(path) => Database::open(path).map_err(|error| io::Error::other(error.to_string()))?,
         None => Database::new(),
     };
     let stdin = io::stdin();
@@ -88,11 +87,16 @@ fn handle_meta_command(db: &mut Database, input: &str) -> Option<String> {
                 "Meta commands:",
                 "  .tables            list tables",
                 "  .schema <table>    show table schema and indexes",
+                "  .import <path> <table>",
+                "                      load a CSV file (header row = column names)",
+                "  .export <path> <table>",
+                "                      write a CSV file (header row = column names)",
                 "  .storage           show persistence directory status",
                 "  .checkpoint        flush snapshot + truncate WAL",
                 "  .help              show this help",
                 "  .quit / .exit      leave the REPL",
                 "",
+                "SELECT supports DISTINCT, UNION [ALL], CASE WHEN, INNER/LEFT JOIN, GROUP BY, HAVING, LIKE, BETWEEN, IN, IS NULL, LIMIT n OFFSET m.",
                 "Launch with a data directory to enable WAL logging and CHECKPOINT snapshots.",
             ]
             .join("\n"),
@@ -110,6 +114,30 @@ fn handle_meta_command(db: &mut Database, input: &str) -> Option<String> {
             let table = parts.next()?;
             match db.describe_table(table) {
                 Ok(description) => Some(description),
+                Err(error) => Some(format!("error: {error}")),
+            }
+        }
+        ".import" => {
+            let args = parts.collect::<Vec<_>>();
+            if args.len() < 2 {
+                return Some("usage: .import <path> <table>".into());
+            }
+            let table = args[args.len() - 1];
+            let path = args[..args.len() - 1].join(" ");
+            match db.import_csv(path, table) {
+                Ok(result) => Some(result.format_for_display()),
+                Err(error) => Some(format!("error: {error}")),
+            }
+        }
+        ".export" => {
+            let args = parts.collect::<Vec<_>>();
+            if args.len() < 2 {
+                return Some("usage: .export <path> <table>".into());
+            }
+            let table = args[args.len() - 1];
+            let path = args[..args.len() - 1].join(" ");
+            match db.export_csv(path, table) {
+                Ok(result) => Some(result.format_for_display()),
                 Err(error) => Some(format!("error: {error}")),
             }
         }
