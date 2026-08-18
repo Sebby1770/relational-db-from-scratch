@@ -22,19 +22,9 @@ pub enum Statement {
     },
     Insert {
         table: String,
-        values: Vec<Value>,
+        source: InsertSource,
     },
-    Select {
-        table: String,
-        alias: Option<String>,
-        joins: Vec<JoinClause>,
-        projection: Projection,
-        predicate: Option<Predicate>,
-        group_by: Vec<String>,
-        order_by: Vec<OrderBy>,
-        limit: Option<usize>,
-        offset: Option<usize>,
-    },
+    Select(Box<SelectStatement>),
     Update {
         table: String,
         assignments: Vec<Assignment>,
@@ -67,10 +57,40 @@ pub enum Projection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InsertSource {
+    Values(Vec<Value>),
+    Select(Box<SelectStatement>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectStatement {
+    pub distinct: bool,
+    pub table: String,
+    pub alias: Option<String>,
+    pub joins: Vec<JoinClause>,
+    pub projection: Projection,
+    pub predicate: Option<Predicate>,
+    pub group_by: Vec<String>,
+    pub having: Option<Predicate>,
+    pub order_by: Vec<OrderBy>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
     Column(String),
     CountAll,
     Sum(String),
+    Min(String),
+    Max(String),
+    Avg(String),
+}
+
+impl SelectItem {
+    pub fn is_aggregate(&self) -> bool {
+        !matches!(self, SelectItem::Column(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,9 +111,18 @@ pub enum JoinType {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Predicate {
     Comparison {
-        column: String,
+        expr: SelectItem,
         op: ComparisonOp,
         value: Value,
+    },
+    Between {
+        expr: SelectItem,
+        low: Value,
+        high: Value,
+    },
+    InList {
+        expr: SelectItem,
+        values: Vec<Value>,
     },
     Like {
         column: String,
@@ -326,6 +355,9 @@ fn is_reserved_after_table(value: &str) -> bool {
             | "EXCEPT"
             | "INTERSECT"
             | "AS"
+            | "DISTINCT"
+            | "BETWEEN"
+            | "IN"
     )
 }
 
@@ -491,6 +523,14 @@ impl Parser {
     fn parse_insert(&mut self) -> Result<Statement> {
         self.expect_keyword("INTO")?;
         let table = self.expect_ident()?;
+
+        if self.consume_keyword("SELECT") {
+            return Ok(Statement::Insert {
+                table,
+                source: InsertSource::Select(Box::new(self.parse_select_statement()?)),
+            });
+        }
+
         self.expect_keyword("VALUES")?;
         self.expect(Token::LParen)?;
 
@@ -504,7 +544,10 @@ impl Parser {
         }
 
         self.expect(Token::RParen)?;
-        Ok(Statement::Insert { table, values })
+        Ok(Statement::Insert {
+            table,
+            source: InsertSource::Values(values),
+        })
     }
 
     fn parse_copy(&mut self) -> Result<Statement> {
@@ -524,22 +567,30 @@ impl Parser {
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
+        Ok(Statement::Select(Box::new(self.parse_select_statement()?)))
+    }
+
+    fn parse_select_statement(&mut self) -> Result<SelectStatement> {
+        let distinct = self.consume_keyword("DISTINCT");
         let projection = self.parse_projection()?;
         self.expect_keyword("FROM")?;
         let (table, alias) = self.parse_table_ref()?;
         let joins = self.parse_joins()?;
         let predicate = self.parse_optional_predicate()?;
         let group_by = self.parse_optional_group_by()?;
+        let having = self.parse_optional_having()?;
         let order_by = self.parse_order_by_list()?;
         let (limit, offset) = self.parse_optional_limit_offset()?;
 
-        Ok(Statement::Select {
+        Ok(SelectStatement {
+            distinct,
             table,
             alias,
             joins,
             projection,
             predicate,
             group_by,
+            having,
             order_by,
             limit,
             offset,
@@ -595,6 +646,30 @@ impl Parser {
             let column = self.parse_column_ref()?;
             self.expect(Token::RParen)?;
             return Ok(SelectItem::Sum(column));
+        }
+
+        if self.peek_function("MIN") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Min(column));
+        }
+
+        if self.peek_function("MAX") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Max(column));
+        }
+
+        if self.peek_function("AVG") {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let column = self.parse_column_ref()?;
+            self.expect(Token::RParen)?;
+            return Ok(SelectItem::Avg(column));
         }
 
         Ok(SelectItem::Column(self.parse_column_ref()?))
@@ -721,14 +796,46 @@ impl Parser {
             return Ok(predicate);
         }
 
-        let column = self.parse_column_ref()?;
+        let expr = self.parse_select_item()?;
+        if self.consume_keyword("BETWEEN") {
+            let low = self.parse_literal()?;
+            self.expect_keyword("AND")?;
+            let high = self.parse_literal()?;
+            return Ok(Predicate::Between { expr, low, high });
+        }
+
+        if self.consume_keyword("IN") {
+            return self.parse_in_list(expr);
+        }
+
         if self.consume_keyword("LIKE") {
+            let SelectItem::Column(column) = expr else {
+                return Err(DbError::Parse(
+                    "LIKE requires a column on the left-hand side".into(),
+                ));
+            };
             return self.parse_like(column);
         }
 
         let op = self.parse_comparison_op()?;
         let value = self.parse_literal()?;
-        Ok(Predicate::Comparison { column, op, value })
+        Ok(Predicate::Comparison { expr, op, value })
+    }
+
+    fn parse_in_list(&mut self, expr: SelectItem) -> Result<Predicate> {
+        self.expect(Token::LParen)?;
+        let mut values = Vec::new();
+        loop {
+            values.push(self.parse_literal()?);
+            if !self.consume(Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::RParen)?;
+        if values.is_empty() {
+            return Err(DbError::Parse("expected value in IN list".into()));
+        }
+        Ok(Predicate::InList { expr, values })
     }
 
     fn parse_like(&mut self, column: String) -> Result<Predicate> {
@@ -809,6 +916,14 @@ impl Parser {
         }
 
         Ok(columns)
+    }
+
+    fn parse_optional_having(&mut self) -> Result<Option<Predicate>> {
+        if !self.consume_keyword("HAVING") {
+            return Ok(None);
+        }
+
+        self.parse_or().map(Some)
     }
 
     fn parse_order_by_list(&mut self) -> Result<Vec<OrderBy>> {

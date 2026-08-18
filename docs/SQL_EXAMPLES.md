@@ -76,6 +76,9 @@ SELECT user_id, SUM(total)
 FROM orders
 GROUP BY user_id
 HAVING SUM(total) > 500;
+
+SELECT DISTINCT user_id FROM orders;
+SELECT MIN(total), MAX(total), AVG(total) FROM orders;
 ```
 
 ## Sorting and Limits
@@ -89,6 +92,23 @@ LIMIT 10 OFFSET 0;
 
 SELECT name FROM users WHERE name LIKE 'Ada%';
 SELECT name FROM users WHERE name LIKE '%Hopper';
+SELECT id FROM users WHERE id BETWEEN 1 AND 10;
+SELECT name FROM users WHERE id IN (1, 2);
+```
+
+## INSERT SELECT
+
+```sql
+INSERT INTO archived
+SELECT id, email, name, active
+FROM users
+WHERE active = false;
+
+INSERT INTO order_names
+SELECT users.name, orders.total
+FROM users
+JOIN orders ON users.id = orders.user_id
+WHERE orders.total > 100;
 ```
 
 ## CSV import
@@ -144,7 +164,7 @@ CREATE INDEX events_created_at_idx ON events(created_at);
 
 SELECT *
 FROM events
-WHERE created_at BETWEEN 1000 AND 2000
+WHERE created_at >= 1000 AND created_at <= 2000
 ORDER BY created_at;
 ```
 

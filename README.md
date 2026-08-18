@@ -18,15 +18,15 @@ Implemented SQL-facing features:
 - Inline constraints: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`
 - `CREATE TABLE`
 - `CREATE INDEX` and `CREATE UNIQUE INDEX`
-- `INSERT INTO ... VALUES`
-- `SELECT`, projection, `COUNT(*)`, `SUM(column)`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT n OFFSET m`
+- `INSERT INTO ... VALUES` and `INSERT INTO dest SELECT ... FROM src`
+- `SELECT`, `SELECT DISTINCT`, projection, `COUNT(*)`, `SUM` / `MIN` / `MAX` / `AVG(column)` (`AVG` is truncated integer division), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT n OFFSET m`
 - `INNER JOIN` / `JOIN` and `LEFT JOIN` with nested-loop execution
 - Qualified columns (`users.name`) plus unambiguous short names after a join
-- Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `AND`, `OR`
+- Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `BETWEEN`, `IN (...)`, `AND`, `OR`
 - `UPDATE ... SET ... WHERE ...`
 - `DELETE FROM ... WHERE ...`
 - `COPY table FROM 'file.csv'` and REPL `.import <path> <table>` (CSV header = columns)
-- `EXPLAIN` for scan vs index lookup, nested-loop join, and hash aggregation
+- `EXPLAIN` for scan vs index lookup, nested-loop join, hash aggregation, `HAVING`, and `DISTINCT`
 - `BEGIN`, `COMMIT`, `ROLLBACK` with an in-memory undo log
 - `ANALYZE` collects per-table statistics used by `EXPLAIN`
 - SQL-correct `NULL` handling in `WHERE` predicates (unknown comparisons filter out)
@@ -76,8 +76,13 @@ FROM users
 JOIN orders ON users.id = orders.user_id
 WHERE orders.total > 100;
 
-SELECT active, COUNT(*), SUM(id) FROM users GROUP BY active;
+SELECT active, COUNT(*), SUM(id) FROM users GROUP BY active HAVING COUNT(*) > 0;
+SELECT DISTINCT active FROM users;
+SELECT MIN(id), MAX(id), AVG(id) FROM users;
 SELECT name FROM users WHERE name LIKE 'Ada%';
+SELECT id FROM users WHERE id BETWEEN 1 AND 10;
+SELECT name FROM users WHERE id IN (1, 2);
+INSERT INTO archived SELECT id, email, name, active FROM users WHERE active = false;
 COPY users FROM 'users.csv';
 
 BEGIN;
@@ -150,6 +155,7 @@ tests/
   basic_sql.rs    Baseline SQL tests
   advanced_sql.rs Constraints, indexes, predicates, transactions
   v03_sql.rs      JOIN, GROUP BY, LIKE, OFFSET, CSV import
+  v04_sql.rs      HAVING, DISTINCT, INSERT SELECT, MIN/MAX/AVG, BETWEEN, IN
   internals.rs    Locking, pages, B+ tree, WAL, statistics
 docs/
   ARCHITECTURE.md Design notes and trade-offs
@@ -184,7 +190,7 @@ Still intentionally not claimed as production-complete:
 - Concurrent SQL sessions
 - MVCC visibility rules
 - Hash join and cost-based join ordering
-- `HAVING`, window functions, and subqueries
+- Window functions and subqueries
 - Real on-disk table files backed by the B+ tree
 
 Those are the right next deepening steps after this broad pass.

@@ -94,7 +94,7 @@ fn handle_meta_command(db: &mut Database, input: &str) -> Option<String> {
                 "  .help              show this help",
                 "  .quit / .exit      leave the REPL",
                 "",
-                "SELECT supports INNER/LEFT JOIN, GROUP BY, LIKE, LIMIT n OFFSET m.",
+                "SELECT supports DISTINCT, INNER/LEFT JOIN, GROUP BY, HAVING, LIKE, BETWEEN, IN, LIMIT n OFFSET m.",
                 "Launch with a data directory to enable WAL logging and CHECKPOINT snapshots.",
             ]
             .join("\n"),

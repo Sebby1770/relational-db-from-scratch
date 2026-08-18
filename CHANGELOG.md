@@ -2,6 +2,21 @@
 
 All notable changes to **relational-db-from-scratch** are documented here.
 
+## [0.4.0] - 2026-08-18
+
+### Added
+- `HAVING` over grouped aggregates: `SELECT dept, COUNT(*) FROM t GROUP BY dept HAVING COUNT(*) > 1`
+- `SELECT DISTINCT` on one or more projected columns
+- `INSERT INTO dest SELECT ... FROM src` with optional joins and `WHERE`; column count must match
+- `MIN(column)`, `MAX(column)`, and `AVG(column)` (AVG is truncated integer division)
+- `BETWEEN` and `IN` list predicates: `col BETWEEN a AND b`, `col IN (1, 2, 3)`
+- `EXPLAIN` reports `Having` and `Distinct` when those clauses are present
+- Integration tests for the 0.4 query surface
+
+### Changed
+- README, roadmap snapshot, and SQL examples cover HAVING, DISTINCT, INSERT SELECT, and richer predicates
+- `SELECT` AST now carries `DISTINCT` and `HAVING`; `INSERT` accepts a `VALUES` or `SELECT` source
+
 ## [0.3.0] - 2026-08-18
 
 ### Added
