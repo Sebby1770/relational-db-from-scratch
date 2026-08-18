@@ -18,18 +18,21 @@ Implemented SQL-facing features:
 - Inline constraints: `PRIMARY KEY`, `UNIQUE`, `NOT NULL`
 - `CREATE TABLE`
 - `CREATE INDEX` and `CREATE UNIQUE INDEX`
-- `INSERT INTO ... VALUES` and `INSERT INTO dest SELECT ... FROM src`
+- `INSERT INTO ... VALUES` (including multi-row lists) and `INSERT INTO dest SELECT ... FROM src`
 - `SELECT`, `SELECT DISTINCT`, projection, `COUNT(*)`, `COUNT(column)` (non-null), `SUM` / `MIN` / `MAX` / `AVG(column)` (`AVG` is truncated integer division), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT n OFFSET m`
-- `INNER JOIN` / `JOIN` and `LEFT JOIN` with nested-loop execution
+- `INNER JOIN` / `JOIN` (hash join), `LEFT JOIN`, `RIGHT JOIN`, and `CROSS JOIN`
 - Qualified columns (`users.name`) plus unambiguous short names after a join
 - Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `BETWEEN`, `NOT BETWEEN`, `IN (...)`, `NOT IN (...)`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`
-- `CASE WHEN pred THEN v1 ELSE v2 END` in the SELECT list
-- `UNION` and `UNION ALL` (same column count; `UNION` deduplicates)
+- `CASE WHEN pred THEN v1 ELSE v2 END` and `COALESCE(column, literal)` in the SELECT list
+- `UNION` / `UNION ALL`, `EXCEPT`, and `INTERSECT` (same column count; set ops deduplicate)
+- `ORDER BY` column name or 1-based position (`ORDER BY 1 DESC`)
 - `UPDATE ... SET ... WHERE ...`
 - `DELETE FROM ... WHERE ...`
 - `ALTER TABLE t ADD COLUMN c INT` (nullable; existing rows get `NULL`)
+- `ALTER TABLE t RENAME TO u`, `TRUNCATE TABLE`, `CREATE TABLE AS SELECT`
+- `CREATE TABLE IF NOT EXISTS` and `DROP TABLE IF EXISTS`
 - `COPY table FROM 'file.csv'` / `COPY table TO 'file.csv'` and REPL `.import` / `.export` (CSV header = columns)
-- `EXPLAIN` for scan vs index lookup, nested-loop join, hash aggregation, `HAVING`, and `DISTINCT`
+- `EXPLAIN` for scan vs index lookup, hash join, nested-loop outer join, hash aggregation, `HAVING`, and `DISTINCT`
 - `BEGIN`, `COMMIT`, `ROLLBACK` with an in-memory undo log
 - `ANALYZE` collects per-table statistics used by `EXPLAIN`
 - SQL-correct `NULL` handling in `WHERE` predicates (unknown comparisons filter out)

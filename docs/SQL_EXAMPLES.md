@@ -117,7 +117,7 @@ JOIN orders ON users.id = orders.user_id
 WHERE orders.total > 100;
 ```
 
-## UNION
+## UNION / EXCEPT / INTERSECT
 
 ```sql
 SELECT id FROM users
@@ -128,12 +128,32 @@ ORDER BY id;
 SELECT name FROM users
 UNION ALL
 SELECT name FROM archived;
+
+SELECT id FROM users
+EXCEPT
+SELECT id FROM archived;
+
+SELECT id FROM users
+INTERSECT
+SELECT id FROM archived;
+```
+
+## CREATE TABLE AS / TRUNCATE / RENAME
+
+```sql
+CREATE TABLE IF NOT EXISTS active_users AS
+SELECT id, name FROM users WHERE active = true;
+
+ALTER TABLE active_users RENAME TO current_users;
+TRUNCATE TABLE current_users;
+DROP TABLE IF EXISTS missing;
 ```
 
 ## ALTER TABLE
 
 ```sql
 ALTER TABLE users ADD COLUMN nickname TEXT;
+SELECT id, COALESCE(nickname, name) FROM users ORDER BY 1;
 ```
 
 Existing rows receive `NULL` in the new column.

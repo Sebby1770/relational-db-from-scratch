@@ -30,14 +30,14 @@ fn inner_join_matches_related_rows_and_applies_filter() {
 }
 
 #[test]
-fn inner_join_explain_uses_nested_loop_join() {
+fn inner_join_explain_uses_hash_join() {
     let mut db = seeded_orders();
     let plan = db
         .execute("EXPLAIN SELECT users.name, orders.total FROM users JOIN orders ON users.id = orders.user_id;")
         .unwrap();
 
     assert!(
-        matches!(plan, QueryResult::Plan { ref plan } if plan.to_ascii_lowercase().contains("nested loop join"))
+        matches!(plan, QueryResult::Plan { ref plan } if plan.to_ascii_lowercase().contains("hash join"))
     );
 }
 

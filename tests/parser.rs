@@ -1,5 +1,6 @@
 use relational_db_from_scratch::parser::{
-    ComparisonOp, InsertSource, JoinType, Predicate, Projection, SelectItem, Statement, parse_sql,
+    ComparisonOp, InsertSource, JoinType, Predicate, Projection, SelectItem, SetOp, Statement,
+    parse_sql,
 };
 
 #[test]
@@ -242,6 +243,7 @@ fn parses_v05_sql_surface() {
         Statement::Select(query) => {
             assert_eq!(query.unions.len(), 1);
             assert!(query.unions[0].all);
+            assert_eq!(query.unions[0].op, SetOp::Union);
             assert_eq!(query.order_by.len(), 1);
         }
         other => panic!("unexpected statement: {other:?}"),

@@ -2,6 +2,26 @@
 
 All notable changes to **relational-db-from-scratch** are documented here.
 
+## [0.6.0] - 2026-08-18
+
+### Added
+- `EXCEPT` and `INTERSECT` set operations (deduplicating)
+- `CROSS JOIN` (cartesian product) and `RIGHT JOIN` (NULL-extended unmatched left rows)
+- Hash join for `INNER JOIN` (`EXPLAIN` reports `hash join`)
+- `CREATE TABLE [IF NOT EXISTS] name AS SELECT ...`
+- `CREATE TABLE IF NOT EXISTS` and `DROP TABLE IF EXISTS`
+- `TRUNCATE TABLE`
+- `ALTER TABLE t RENAME TO u` (transaction-safe)
+- Multi-row `INSERT INTO t VALUES (1), (2)`
+- `COALESCE(column, literal)` in the SELECT list
+- `ORDER BY 1` (1-based output column position)
+- Integration tests for the 0.6 query surface
+
+### Changed
+- `INNER JOIN` now uses a hash join instead of nested loops
+- `UnionPart` carries a `SetOp` (`UNION` / `EXCEPT` / `INTERSECT`)
+- README, roadmap snapshot, and SQL examples cover the 0.6 surface
+
 ## [0.5.0] - 2026-08-18
 
 ### Added

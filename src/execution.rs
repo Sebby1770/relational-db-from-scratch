@@ -6,8 +6,8 @@ use crate::db::Database;
 use crate::error::{DbError, Result};
 use crate::optimizer::TableStats;
 use crate::parser::{
-    Assignment, ComparisonOp, InsertSource, JoinClause, JoinType, OrderBy, Predicate, Projection,
-    SelectItem, SelectStatement, SortDirection, Statement,
+    AlterAction, Assignment, ComparisonOp, InsertSource, JoinClause, JoinType, OrderBy, Predicate,
+    Projection, SelectItem, SelectStatement, SetOp, SortDirection, Statement,
 };
 use crate::row::Row;
 use crate::schema::{Column, DataType, TableSchema, normalize_identifier};
@@ -32,6 +32,10 @@ pub enum QueryResult {
     ColumnAdded {
         table: String,
         column: String,
+    },
+    TableRenamed {
+        from: String,
+        to: String,
     },
     RowsInserted {
         count: usize,
@@ -80,6 +84,7 @@ impl QueryResult {
             QueryResult::ColumnAdded { table, column } => {
                 format!("added column {column} to {table}")
             }
+            QueryResult::TableRenamed { from, to } => format!("renamed table {from} to {to}"),
             QueryResult::RowsInserted { count } => format!("inserted {count} row(s)"),
             QueryResult::RowsUpdated { count } => format!("updated {count} row(s)"),
             QueryResult::RowsDeleted { count } => format!("deleted {count} row(s)"),
@@ -282,6 +287,11 @@ enum BoundSelectItem {
         else_value: Value,
         output_name: String,
     },
+    Coalesce {
+        index: usize,
+        fallback: Value,
+        output_name: String,
+    },
 }
 
 impl BoundSelectItem {
@@ -293,7 +303,8 @@ impl BoundSelectItem {
             | BoundSelectItem::Min { output_name, .. }
             | BoundSelectItem::Max { output_name, .. }
             | BoundSelectItem::Avg { output_name, .. }
-            | BoundSelectItem::Case { output_name, .. } => output_name.clone(),
+            | BoundSelectItem::Case { output_name, .. }
+            | BoundSelectItem::Coalesce { output_name, .. } => output_name.clone(),
             BoundSelectItem::CountAll => "count".into(),
         }
     }
@@ -327,22 +338,38 @@ struct SelectQuery<'a> {
 
 pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Result<QueryResult> {
     match statement {
-        Statement::CreateTable { name, columns } => {
+        Statement::CreateTable {
+            name,
+            columns,
+            if_not_exists,
+        } => {
             let schema = TableSchema::new(name.clone(), columns)?;
             let table_name = normalize_identifier(&name);
             db.acquire_write_lock(&table_name)?;
+            if if_not_exists && db.tables.contains_key(&table_name) {
+                return Ok(QueryResult::TableCreated { table: table_name });
+            }
             db.create_table(schema)?;
             db.record_undo(UndoRecord::CreateTable {
                 table: table_name.clone(),
             });
             Ok(QueryResult::TableCreated { table: table_name })
         }
-        Statement::DropTable { name } => {
+        Statement::CreateTableAs {
+            name,
+            query,
+            if_not_exists,
+        } => create_table_as(db, &name, *query, if_not_exists),
+        Statement::DropTable { name, if_exists } => {
             let table_name = normalize_identifier(&name);
             db.acquire_write_lock(&table_name)?;
+            if if_exists && !db.tables.contains_key(&table_name) {
+                return Ok(QueryResult::TableDropped { table: table_name });
+            }
             db.drop_table(&table_name)?;
             Ok(QueryResult::TableDropped { table: table_name })
         }
+        Statement::Truncate { table } => truncate_table(db, &table),
         Statement::DropIndex { name } => {
             let index_name = normalize_identifier(&name);
             let table_name = db.table_for_index(&index_name)?;
@@ -367,7 +394,7 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
             Ok(QueryResult::IndexCreated { index: index_name })
         }
         Statement::Insert { table, source } => match source {
-            InsertSource::Values(values) => insert(db, &table, values),
+            InsertSource::Values(rows) => insert_rows(db, &table, rows),
             InsertSource::Select(query) => insert_select(db, &table, *query),
         },
         Statement::Select(query) => execute_select(db, &query),
@@ -379,7 +406,10 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
         Statement::Delete { table, predicate } => delete(db, &table, predicate.as_ref()),
         Statement::CopyFrom { table, path } => copy_from(db, &table, &path),
         Statement::CopyTo { table, path } => copy_to(db, &table, &path),
-        Statement::AlterTable { table, column } => alter_table_add_column(db, &table, column),
+        Statement::AlterTable { table, action } => match action {
+            AlterAction::AddColumn { column } => alter_table_add_column(db, &table, column),
+            AlterAction::RenameTable { new_name } => rename_table(db, &table, &new_name),
+        },
         Statement::Explain(statement) => explain(db, &statement),
         Statement::Begin => {
             let id = db.begin()?.0;
@@ -401,22 +431,60 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
     }
 }
 
-fn insert(db: &mut Database, table_name: &str, row: Row) -> Result<QueryResult> {
+fn insert_rows(db: &mut Database, table_name: &str, rows: Vec<Row>) -> Result<QueryResult> {
+    if rows.is_empty() {
+        return Ok(QueryResult::RowsInserted { count: 0 });
+    }
+    if rows.len() == 1 {
+        let table_name = normalize_identifier(table_name);
+        db.acquire_write_lock(&table_name)?;
+        let row_id = {
+            let table = db
+                .tables
+                .get_mut(&table_name)
+                .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+            table.insert(rows.into_iter().next().expect("one row"))?
+        };
+
+        db.record_undo(UndoRecord::Insert {
+            table: table_name,
+            row_id,
+        });
+        return Ok(QueryResult::RowsInserted { count: 1 });
+    }
+
     let table_name = normalize_identifier(table_name);
     db.acquire_write_lock(&table_name)?;
-    let row_id = {
+    let mut undo_records = Vec::new();
+    {
         let table = db
             .tables
             .get_mut(&table_name)
             .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
-        table.insert(row)?
-    };
-
-    db.record_undo(UndoRecord::Insert {
-        table: table_name,
-        row_id,
-    });
-    Ok(QueryResult::RowsInserted { count: 1 })
+        let mut inserted_ids = Vec::new();
+        for row in rows {
+            match table.insert(row) {
+                Ok(row_id) => inserted_ids.push(row_id),
+                Err(error) => {
+                    for row_id in inserted_ids.iter().rev() {
+                        let _ = table.delete_row(*row_id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        for row_id in inserted_ids {
+            undo_records.push(UndoRecord::Insert {
+                table: table_name.clone(),
+                row_id,
+            });
+        }
+    }
+    let inserted = undo_records.len();
+    for undo in undo_records {
+        db.record_undo(undo);
+    }
+    Ok(QueryResult::RowsInserted { count: inserted })
 }
 
 fn select_query(query: &SelectStatement) -> SelectQuery<'_> {
@@ -537,9 +605,19 @@ fn execute_select(db: &mut Database, query: &SelectStatement) -> Result<QueryRes
                 got: next_columns.len(),
             });
         }
-        rows.extend(next_rows);
-        if !part.all {
-            rows = distinct_rows(rows);
+        match part.op {
+            SetOp::Union => {
+                rows.extend(next_rows);
+                if !part.all {
+                    rows = distinct_rows(rows);
+                }
+            }
+            SetOp::Except => {
+                rows = except_rows(rows, next_rows);
+            }
+            SetOp::Intersect => {
+                rows = intersect_rows(rows, next_rows);
+            }
         }
     }
 
@@ -639,18 +717,30 @@ fn scan_and_join(db: &Database, query: &SelectQuery<'_>) -> Result<(QuerySchema,
             .ok_or_else(|| DbError::TableNotFound(right_name.clone()))?;
         let right_schema =
             QuerySchema::from_table(&right_name, join.alias.as_deref(), &right_table.schema);
-        let (left_index, right_index) =
-            resolve_join_columns(&schema, &right_schema, &join.left, &join.right)?;
         let right_width = right_schema.columns.len();
+        let left_width = schema.columns.len();
         let right_rows = right_table.rows().cloned().collect::<Vec<_>>();
-        rows = nested_loop_join(
-            &rows,
-            &right_rows,
-            left_index,
-            right_index,
-            join.join_type,
-            right_width,
-        );
+        rows = if join.join_type == JoinType::Cross {
+            cartesian_join(&rows, &right_rows)
+        } else {
+            let (left_index, right_index) =
+                resolve_join_columns(&schema, &right_schema, &join.left, &join.right)?;
+            match join.join_type {
+                JoinType::Inner => hash_join(&rows, &right_rows, left_index, right_index),
+                JoinType::Left => nested_loop_join(
+                    &rows,
+                    &right_rows,
+                    left_index,
+                    right_index,
+                    JoinType::Left,
+                    right_width,
+                ),
+                JoinType::Right => {
+                    right_join(&rows, &right_rows, left_index, right_index, left_width)
+                }
+                JoinType::Cross => unreachable!("cross join handled above"),
+            }
+        };
         schema = schema.merge(right_schema);
     }
 
@@ -699,6 +789,77 @@ fn resolve_join_columns(
     Err(DbError::InvalidStatement(format!(
         "cannot resolve join condition {first} = {second}"
     )))
+}
+
+fn cartesian_join(left_rows: &[Row], right_rows: &[Row]) -> Vec<Row> {
+    let mut output = Vec::new();
+    for left in left_rows {
+        for right in right_rows {
+            let mut row = left.clone();
+            row.extend(right.iter().cloned());
+            output.push(row);
+        }
+    }
+    output
+}
+
+fn hash_join(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_index: usize,
+    right_index: usize,
+) -> Vec<Row> {
+    let mut buckets: HashMap<Value, Vec<&Row>> = HashMap::new();
+    for right in right_rows {
+        if !right[right_index].is_null() {
+            buckets
+                .entry(right[right_index].clone())
+                .or_default()
+                .push(right);
+        }
+    }
+
+    let mut output = Vec::new();
+    for left in left_rows {
+        if left[left_index].is_null() {
+            continue;
+        }
+        if let Some(matches) = buckets.get(&left[left_index]) {
+            for right in matches {
+                let mut row = left.clone();
+                row.extend(right.iter().cloned());
+                output.push(row);
+            }
+        }
+    }
+    output
+}
+
+fn right_join(
+    left_rows: &[Row],
+    right_rows: &[Row],
+    left_index: usize,
+    right_index: usize,
+    left_width: usize,
+) -> Vec<Row> {
+    let mut output = Vec::new();
+    for right in right_rows {
+        let mut matched = false;
+        for left in left_rows {
+            if join_values_equal(&left[left_index], &right[right_index]) {
+                let mut row = left.clone();
+                row.extend(right.iter().cloned());
+                output.push(row);
+                matched = true;
+            }
+        }
+        if !matched {
+            let mut row = vec![Value::Null; left_width];
+            row.extend(right.iter().cloned());
+            output.push(row);
+        }
+    }
+    output
 }
 
 fn nested_loop_join(
@@ -824,6 +985,14 @@ fn bind_select_item(schema: &QuerySchema, item: &SelectItem) -> Result<BoundSele
                 output_name: "avg".into(),
             })
         }
+        SelectItem::Coalesce { column, fallback } => {
+            let index = schema.resolve(column)?;
+            Ok(BoundSelectItem::Coalesce {
+                index,
+                fallback: fallback.clone(),
+                output_name: "coalesce".into(),
+            })
+        }
     }
 }
 
@@ -880,12 +1049,16 @@ fn aggregate_rows(
     }
 
     for item in items {
-        if let BoundSelectItem::Column { index, output_name } = item
-            && !group_indexes.contains(index)
-        {
-            return Err(DbError::InvalidStatement(format!(
-                "column {output_name} must appear in GROUP BY or be an aggregate"
-            )));
+        match item {
+            BoundSelectItem::Column { index, output_name }
+            | BoundSelectItem::Coalesce {
+                index, output_name, ..
+            } if !group_indexes.contains(index) => {
+                return Err(DbError::InvalidStatement(format!(
+                    "column {output_name} must appear in GROUP BY or be an aggregate"
+                )));
+            }
+            _ => {}
         }
     }
 
@@ -947,6 +1120,19 @@ fn eval_bound_item(rows: &[Row], item: &BoundSelectItem) -> Value {
         BoundSelectItem::Min { index, .. } => extremum_column(rows, *index, Ordering::Less),
         BoundSelectItem::Max { index, .. } => extremum_column(rows, *index, Ordering::Greater),
         BoundSelectItem::Avg { index, .. } => avg_int_column(rows, *index),
+        BoundSelectItem::Coalesce {
+            index, fallback, ..
+        } => {
+            let value = rows
+                .first()
+                .map(|row| row[*index].clone())
+                .unwrap_or(Value::Null);
+            if value.is_null() {
+                fallback.clone()
+            } else {
+                value
+            }
+        }
         BoundSelectItem::Case {
             when,
             then_value,
@@ -1023,6 +1209,30 @@ fn distinct_rows(rows: Vec<Row>) -> Vec<Row> {
         }
     }
     unique
+}
+
+fn except_rows(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
+    let right_set: HashSet<Row> = right.into_iter().collect();
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for row in left {
+        if !right_set.contains(&row) && seen.insert(row.clone()) {
+            output.push(row);
+        }
+    }
+    output
+}
+
+fn intersect_rows(left: Vec<Row>, right: Vec<Row>) -> Vec<Row> {
+    let right_set: HashSet<Row> = right.into_iter().collect();
+    let mut seen = HashSet::new();
+    let mut output = Vec::new();
+    for row in left {
+        if right_set.contains(&row) && seen.insert(row.clone()) {
+            output.push(row);
+        }
+    }
+    output
 }
 
 fn matches_group(rows: &[Row], predicate: Option<&BoundPredicate>) -> bool {
@@ -1108,6 +1318,13 @@ fn sort_rows(schema: &QuerySchema, rows: &mut [Row], order_by: &[OrderBy]) -> Re
 }
 
 fn resolve_order_column(schema: &QuerySchema, column: &str) -> Result<usize> {
+    if let Ok(position) = column.parse::<usize>()
+        && position >= 1
+        && position <= schema.columns.len()
+    {
+        return Ok(position - 1);
+    }
+
     let column = normalize_identifier(column);
     if let Ok(index) = schema.resolve(&column) {
         return Ok(index);
@@ -1283,6 +1500,141 @@ fn alter_table_add_column(
         table: table_name,
         column: column_name,
     })
+}
+
+fn rename_table(db: &mut Database, table_name: &str, new_name: &str) -> Result<QueryResult> {
+    let from = normalize_identifier(table_name);
+    let to = normalize_identifier(new_name);
+    db.acquire_write_lock(&from)?;
+    db.acquire_write_lock(&to)?;
+    if from == to {
+        return Ok(QueryResult::TableRenamed { from, to });
+    }
+    if db.tables.contains_key(&to) {
+        return Err(DbError::TableExists(to));
+    }
+    let mut table = db
+        .tables
+        .remove(&from)
+        .ok_or_else(|| DbError::TableNotFound(from.clone()))?;
+    table.schema.name = to.clone();
+    db.tables.insert(to.clone(), table);
+    if let Some(stats) = db.stats.remove(&from) {
+        db.stats.insert(to.clone(), stats);
+    }
+    db.record_undo(UndoRecord::RenameTable {
+        from: from.clone(),
+        to: to.clone(),
+    });
+    Ok(QueryResult::TableRenamed { from, to })
+}
+
+fn truncate_table(db: &mut Database, table_name: &str) -> Result<QueryResult> {
+    let table_name = normalize_identifier(table_name);
+    db.acquire_write_lock(&table_name)?;
+    let stored = {
+        let table = db
+            .tables
+            .get(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        table.stored_rows().collect::<Vec<_>>()
+    };
+    let mut undo_records = Vec::new();
+    {
+        let table = db
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        for row in &stored {
+            table.delete_row(row.row_id)?;
+            undo_records.push(UndoRecord::Delete {
+                table: table_name.clone(),
+                stored: row.clone(),
+            });
+        }
+    }
+    let count = undo_records.len();
+    for undo in undo_records {
+        db.record_undo(undo);
+    }
+    Ok(QueryResult::RowsDeleted { count })
+}
+
+fn create_table_as(
+    db: &mut Database,
+    name: &str,
+    query: SelectStatement,
+    if_not_exists: bool,
+) -> Result<QueryResult> {
+    let table_name = normalize_identifier(name);
+    if if_not_exists && db.tables.contains_key(&table_name) {
+        return Ok(QueryResult::TableCreated { table: table_name });
+    }
+
+    let selected = execute_select(db, &query)?;
+    let QueryResult::Rows { columns, rows } = selected else {
+        return Err(DbError::InvalidStatement(
+            "CREATE TABLE AS SELECT did not produce rows".into(),
+        ));
+    };
+
+    let schema_columns = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column_name)| {
+            let data_type = infer_column_type(&rows, index);
+            Column::new(column_name, data_type)
+        })
+        .collect();
+    let schema = TableSchema::new(table_name.clone(), schema_columns)?;
+    db.acquire_write_lock(&table_name)?;
+    db.create_table(schema)?;
+    db.record_undo(UndoRecord::CreateTable {
+        table: table_name.clone(),
+    });
+
+    let mut undo_records = Vec::new();
+    {
+        let table = db
+            .tables
+            .get_mut(&table_name)
+            .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+        let mut inserted_ids = Vec::new();
+        for row in rows {
+            match table.insert(row) {
+                Ok(row_id) => inserted_ids.push(row_id),
+                Err(error) => {
+                    for row_id in inserted_ids.iter().rev() {
+                        let _ = table.delete_row(*row_id);
+                    }
+                    db.tables.remove(&table_name);
+                    return Err(error);
+                }
+            }
+        }
+        for row_id in inserted_ids {
+            undo_records.push(UndoRecord::Insert {
+                table: table_name.clone(),
+                row_id,
+            });
+        }
+    }
+    for undo in undo_records {
+        db.record_undo(undo);
+    }
+    Ok(QueryResult::TableCreated { table: table_name })
+}
+
+fn infer_column_type(rows: &[Row], index: usize) -> crate::schema::DataType {
+    for row in rows {
+        match row.get(index) {
+            Some(Value::Int(_)) => return DataType::Int,
+            Some(Value::Text(_)) => return DataType::Text,
+            Some(Value::Bool(_)) => return DataType::Bool,
+            _ => {}
+        }
+    }
+    DataType::Text
 }
 
 fn copy_to(db: &mut Database, table_name: &str, path: &str) -> Result<QueryResult> {
@@ -1621,13 +1973,24 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
                 normalize_identifier(table)
             )
         }
-        Statement::AlterTable { table, column } => {
-            format!(
+        Statement::AlterTable { table, action } => match action {
+            AlterAction::AddColumn { column } => format!(
                 "AlterTable\n  Table: {}\n  Add: {} {}",
                 normalize_identifier(table),
                 column.name,
                 column.data_type
-            )
+            ),
+            AlterAction::RenameTable { new_name } => format!(
+                "AlterTable\n  Table: {}\n  RenameTo: {}",
+                normalize_identifier(table),
+                normalize_identifier(new_name)
+            ),
+        },
+        Statement::CreateTableAs { name, .. } => {
+            format!("CreateTableAs\n  Table: {}", normalize_identifier(name))
+        }
+        Statement::Truncate { table } => {
+            format!("Truncate\n  Table: {}", normalize_identifier(table))
         }
         other => format!("{other:?}"),
     };
@@ -1638,7 +2001,12 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
 fn explain_select_statement(db: &Database, query: &SelectStatement) -> Result<String> {
     let mut plan = explain_select(db, &select_query(query))?;
     for part in &query.unions {
-        let kind = if part.all { "Union All" } else { "Union" };
+        let kind = match (part.op, part.all) {
+            (SetOp::Union, true) => "Union All",
+            (SetOp::Union, false) => "Union",
+            (SetOp::Except, _) => "Except",
+            (SetOp::Intersect, _) => "Intersect",
+        };
         let arm = explain_select(db, &select_query(&part.query))?;
         let indented = arm
             .lines()
@@ -1675,20 +2043,37 @@ fn explain_select(db: &Database, query: &SelectQuery<'_>) -> Result<String> {
         let join_kind = match join.join_type {
             JoinType::Inner => "INNER",
             JoinType::Left => "LEFT",
+            JoinType::Right => "RIGHT",
+            JoinType::Cross => "CROSS",
+        };
+        let method = match join.join_type {
+            JoinType::Inner => "hash join",
+            JoinType::Cross => "cross product",
+            JoinType::Left | JoinType::Right => "nested loop join",
         };
         let right_label = match &join.alias {
             Some(alias) => format!("{right_name} AS {alias}"),
             None => right_name,
         };
-        lines.push(format!(
-            "  Join: nested loop join {join_kind} {right_label} ON {} = {}",
-            join.left, join.right
-        ));
+        if join.join_type == JoinType::Cross {
+            lines.push(format!("  Join: {method} {join_kind} {right_label}"));
+        } else {
+            lines.push(format!(
+                "  Join: {method} {join_kind} {right_label} ON {} = {}",
+                join.left, join.right
+            ));
+        }
     }
 
     let access = if query.joins.is_empty() {
         let predicate = resolve_predicate(&table_ref.schema, query.predicate)?;
         describe_access_path(table_ref, predicate.as_ref(), db.stats.get(&table_name))
+    } else if query
+        .joins
+        .iter()
+        .any(|join| join.join_type == JoinType::Inner)
+    {
+        "hash join".into()
     } else {
         "nested loop join".into()
     };
@@ -1770,6 +2155,9 @@ fn format_select_item(item: &SelectItem) -> String {
             "CASE WHEN {} THEN {then_value} ELSE {else_value} END",
             format_predicate(when)
         ),
+        SelectItem::Coalesce { column, fallback } => {
+            format!("COALESCE({column}, {fallback})")
+        }
     }
 }
 
@@ -2096,6 +2484,14 @@ fn validate_expr_value(schema: &QuerySchema, expr: &BoundSelectItem, value: &Val
                     got: value.type_name().to_string(),
                 })
             };
+        }
+        BoundSelectItem::Coalesce {
+            index, fallback, ..
+        } => {
+            if fallback.is_null() {
+                return Ok(());
+            }
+            (schema.columns[*index].data_type.clone(), expr.output_name())
         }
     };
 

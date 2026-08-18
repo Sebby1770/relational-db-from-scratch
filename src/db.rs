@@ -331,6 +331,18 @@ impl Database {
                     .ok_or_else(|| DbError::TableNotFound(table.clone()))?;
                 table.drop_trailing_column()
             }
+            UndoRecord::RenameTable { from, to } => {
+                let mut table = self
+                    .tables
+                    .remove(&to)
+                    .ok_or_else(|| DbError::TableNotFound(to.clone()))?;
+                table.schema.name = from.clone();
+                self.tables.insert(from.clone(), table);
+                if let Some(stats) = self.stats.remove(&to) {
+                    self.stats.insert(from, stats);
+                }
+                Ok(())
+            }
         }
     }
 }
