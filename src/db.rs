@@ -64,6 +64,11 @@ impl Database {
         self.execute(&format!("COPY {table} FROM '{path}'"))
     }
 
+    pub fn export_csv(&mut self, path: impl AsRef<Path>, table: &str) -> Result<QueryResult> {
+        let path = path.as_ref().to_string_lossy().replace('\'', "''");
+        self.execute(&format!("COPY {table} TO '{path}'"))
+    }
+
     pub(crate) fn execute_internal(&mut self, sql: &str) -> Result<QueryResult> {
         let statement = parse_sql(sql)?;
         execute_statement(self, statement)
@@ -318,6 +323,13 @@ impl Database {
                     .get_mut(&table)
                     .ok_or_else(|| DbError::TableNotFound(table.clone()))?;
                 table.replace_row(row_id, old_row).map(|_| ())
+            }
+            UndoRecord::AddColumn { table } => {
+                let table = self
+                    .tables
+                    .get_mut(&table)
+                    .ok_or_else(|| DbError::TableNotFound(table.clone()))?;
+                table.drop_trailing_column()
             }
         }
     }

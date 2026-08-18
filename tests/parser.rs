@@ -198,3 +198,71 @@ fn parses_having_distinct_insert_select_and_richer_predicates() {
         other => panic!("unexpected statement: {other:?}"),
     }
 }
+
+#[test]
+fn parses_v05_sql_surface() {
+    let is_null = parse_sql("SELECT id FROM items WHERE label IS NULL;").unwrap();
+    assert!(matches!(
+        is_null,
+        Statement::Select(query) if matches!(query.predicate, Some(Predicate::IsNull { negated: false, .. }))
+    ));
+
+    let is_not_null = parse_sql("SELECT id FROM items WHERE label IS NOT NULL;").unwrap();
+    assert!(matches!(
+        is_not_null,
+        Statement::Select(query) if matches!(query.predicate, Some(Predicate::IsNull { negated: true, .. }))
+    ));
+
+    let not_in = parse_sql("SELECT id FROM scores WHERE id NOT IN (1, 2);").unwrap();
+    assert!(matches!(
+        not_in,
+        Statement::Select(query)
+            if matches!(query.predicate, Some(Predicate::InList { negated: true, .. }))
+    ));
+
+    let not_between = parse_sql("SELECT id FROM scores WHERE points NOT BETWEEN 1 AND 5;").unwrap();
+    assert!(matches!(
+        not_between,
+        Statement::Select(query)
+            if matches!(query.predicate, Some(Predicate::Between { negated: true, .. }))
+    ));
+
+    let count_col = parse_sql("SELECT COUNT(label) FROM items;").unwrap();
+    match count_col {
+        Statement::Select(query) => match query.projection {
+            Projection::Items(items) => assert!(matches!(items[0], SelectItem::Count(_))),
+            other => panic!("unexpected projection: {other:?}"),
+        },
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let unioned =
+        parse_sql("SELECT n FROM left_t UNION ALL SELECT n FROM right_t ORDER BY n;").unwrap();
+    match unioned {
+        Statement::Select(query) => {
+            assert_eq!(query.unions.len(), 1);
+            assert!(query.unions[0].all);
+            assert_eq!(query.order_by.len(), 1);
+        }
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    let case_when =
+        parse_sql("SELECT CASE WHEN n >= 10 THEN 'big' ELSE 'small' END FROM emp;").unwrap();
+    match case_when {
+        Statement::Select(query) => match query.projection {
+            Projection::Items(items) => assert!(matches!(items[0], SelectItem::Case { .. })),
+            other => panic!("unexpected projection: {other:?}"),
+        },
+        other => panic!("unexpected statement: {other:?}"),
+    }
+
+    assert!(matches!(
+        parse_sql("ALTER TABLE users ADD COLUMN active BOOL;").unwrap(),
+        Statement::AlterTable { .. }
+    ));
+    assert!(matches!(
+        parse_sql("COPY users TO 'users.csv';").unwrap(),
+        Statement::CopyTo { .. }
+    ));
+}

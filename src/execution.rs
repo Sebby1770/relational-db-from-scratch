@@ -29,6 +29,10 @@ pub enum QueryResult {
     IndexDropped {
         index: String,
     },
+    ColumnAdded {
+        table: String,
+        column: String,
+    },
     RowsInserted {
         count: usize,
     },
@@ -60,6 +64,10 @@ pub enum QueryResult {
     Checkpoint {
         message: String,
     },
+    RowsExported {
+        path: String,
+        count: usize,
+    },
 }
 
 impl QueryResult {
@@ -69,6 +77,9 @@ impl QueryResult {
             QueryResult::IndexCreated { index } => format!("created index {index}"),
             QueryResult::TableDropped { table } => format!("dropped table {table}"),
             QueryResult::IndexDropped { index } => format!("dropped index {index}"),
+            QueryResult::ColumnAdded { table, column } => {
+                format!("added column {column} to {table}")
+            }
             QueryResult::RowsInserted { count } => format!("inserted {count} row(s)"),
             QueryResult::RowsUpdated { count } => format!("updated {count} row(s)"),
             QueryResult::RowsDeleted { count } => format!("deleted {count} row(s)"),
@@ -81,6 +92,9 @@ impl QueryResult {
             }
             QueryResult::Analyzed { tables } => format!("analyzed {}", tables.join(", ")),
             QueryResult::Checkpoint { message } => message.clone(),
+            QueryResult::RowsExported { path, count } => {
+                format!("exported {count} row(s) to {path}")
+            }
         }
     }
 }
@@ -96,10 +110,16 @@ enum BoundPredicate {
         expr: BoundSelectItem,
         low: Value,
         high: Value,
+        negated: bool,
     },
     InList {
         expr: BoundSelectItem,
         values: Vec<Value>,
+        negated: bool,
+    },
+    IsNull {
+        expr: BoundSelectItem,
+        negated: bool,
     },
     Like {
         column_index: usize,
@@ -231,28 +251,63 @@ fn split_qualified(column: &str) -> Option<(String, String)> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BoundSelectItem {
-    Column { index: usize, output_name: String },
+    Column {
+        index: usize,
+        output_name: String,
+    },
     CountAll,
-    Sum { index: usize, output_name: String },
-    Min { index: usize, output_name: String },
-    Max { index: usize, output_name: String },
-    Avg { index: usize, output_name: String },
+    Count {
+        index: usize,
+        output_name: String,
+    },
+    Sum {
+        index: usize,
+        output_name: String,
+    },
+    Min {
+        index: usize,
+        output_name: String,
+    },
+    Max {
+        index: usize,
+        output_name: String,
+    },
+    Avg {
+        index: usize,
+        output_name: String,
+    },
+    Case {
+        when: Box<BoundPredicate>,
+        then_value: Value,
+        else_value: Value,
+        output_name: String,
+    },
 }
 
 impl BoundSelectItem {
     fn output_name(&self) -> String {
         match self {
             BoundSelectItem::Column { output_name, .. }
+            | BoundSelectItem::Count { output_name, .. }
             | BoundSelectItem::Sum { output_name, .. }
             | BoundSelectItem::Min { output_name, .. }
             | BoundSelectItem::Max { output_name, .. }
-            | BoundSelectItem::Avg { output_name, .. } => output_name.clone(),
+            | BoundSelectItem::Avg { output_name, .. }
+            | BoundSelectItem::Case { output_name, .. } => output_name.clone(),
             BoundSelectItem::CountAll => "count".into(),
         }
     }
 
     fn is_aggregate(&self) -> bool {
-        !matches!(self, BoundSelectItem::Column { .. })
+        matches!(
+            self,
+            BoundSelectItem::CountAll
+                | BoundSelectItem::Count { .. }
+                | BoundSelectItem::Sum { .. }
+                | BoundSelectItem::Min { .. }
+                | BoundSelectItem::Max { .. }
+                | BoundSelectItem::Avg { .. }
+        )
     }
 }
 
@@ -315,7 +370,7 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
             InsertSource::Values(values) => insert(db, &table, values),
             InsertSource::Select(query) => insert_select(db, &table, *query),
         },
-        Statement::Select(query) => select(db, select_query(&query)),
+        Statement::Select(query) => execute_select(db, &query),
         Statement::Update {
             table,
             assignments,
@@ -323,6 +378,8 @@ pub(crate) fn execute_statement(db: &mut Database, statement: Statement) -> Resu
         } => update(db, &table, &assignments, predicate.as_ref()),
         Statement::Delete { table, predicate } => delete(db, &table, predicate.as_ref()),
         Statement::CopyFrom { table, path } => copy_from(db, &table, &path),
+        Statement::CopyTo { table, path } => copy_to(db, &table, &path),
+        Statement::AlterTable { table, column } => alter_table_add_column(db, &table, column),
         Statement::Explain(statement) => explain(db, &statement),
         Statement::Begin => {
             let id = db.begin()?.0;
@@ -383,7 +440,7 @@ fn insert_select(
     table_name: &str,
     query: SelectStatement,
 ) -> Result<QueryResult> {
-    let selected = select(db, select_query(&query))?;
+    let selected = execute_select(db, &query)?;
 
     let QueryResult::Rows { rows, .. } = selected else {
         return Err(DbError::InvalidStatement(
@@ -444,6 +501,52 @@ fn insert_select(
     }
 
     Ok(QueryResult::RowsInserted { count: inserted })
+}
+
+fn execute_select(db: &mut Database, query: &SelectStatement) -> Result<QueryResult> {
+    if query.unions.is_empty() {
+        return select(db, select_query(query));
+    }
+
+    let mut first = query.clone();
+    first.unions.clear();
+    first.order_by.clear();
+    first.limit = None;
+    first.offset = None;
+    let selected = select(db, select_query(&first))?;
+    let QueryResult::Rows { columns, mut rows } = selected else {
+        return Err(DbError::InvalidStatement(
+            "UNION source did not produce rows".into(),
+        ));
+    };
+
+    for part in &query.unions {
+        let next = select(db, select_query(&part.query))?;
+        let QueryResult::Rows {
+            columns: next_columns,
+            rows: next_rows,
+        } = next
+        else {
+            return Err(DbError::InvalidStatement(
+                "UNION source did not produce rows".into(),
+            ));
+        };
+        if next_columns.len() != columns.len() {
+            return Err(DbError::ArityMismatch {
+                expected: columns.len(),
+                got: next_columns.len(),
+            });
+        }
+        rows.extend(next_rows);
+        if !part.all {
+            rows = distinct_rows(rows);
+        }
+    }
+
+    let output_schema = QuerySchema::from_output_names(&columns);
+    sort_rows(&output_schema, &mut rows, &query.order_by)?;
+    apply_offset_limit(&mut rows, query.offset, query.limit);
+    Ok(QueryResult::Rows { columns, rows })
 }
 
 fn select(db: &mut Database, query: SelectQuery<'_>) -> Result<QueryResult> {
@@ -675,6 +778,26 @@ fn bind_select_item(schema: &QuerySchema, item: &SelectItem) -> Result<BoundSele
             })
         }
         SelectItem::CountAll => Ok(BoundSelectItem::CountAll),
+        SelectItem::Count(column) => {
+            let index = schema.resolve(column)?;
+            Ok(BoundSelectItem::Count {
+                index,
+                output_name: "count".into(),
+            })
+        }
+        SelectItem::Case {
+            when,
+            then_value,
+            else_value,
+        } => {
+            let when = resolve_query_predicate_inner(schema, when, false)?;
+            Ok(BoundSelectItem::Case {
+                when: Box::new(when),
+                then_value: then_value.clone(),
+                else_value: else_value.clone(),
+                output_name: "case".into(),
+            })
+        }
         SelectItem::Sum(column) => {
             bind_int_aggregate(schema, column, "sum", |index| BoundSelectItem::Sum {
                 index,
@@ -728,14 +851,11 @@ fn column_output_name(column: &str) -> String {
 fn project_row(row: &Row, items: &[BoundSelectItem]) -> Row {
     items
         .iter()
-        .map(|item| match item {
-            BoundSelectItem::Column { index, .. } => row[*index].clone(),
-            BoundSelectItem::CountAll
-            | BoundSelectItem::Sum { .. }
-            | BoundSelectItem::Min { .. }
-            | BoundSelectItem::Max { .. }
-            | BoundSelectItem::Avg { .. } => {
+        .map(|item| {
+            if item.is_aggregate() {
                 unreachable!("aggregates are projected by hash grouping")
+            } else {
+                eval_bound_item(std::slice::from_ref(row), item)
             }
         })
         .collect()
@@ -822,11 +942,28 @@ fn eval_bound_item(rows: &[Row], item: &BoundSelectItem) -> Value {
             .map(|row| row[*index].clone())
             .unwrap_or(Value::Null),
         BoundSelectItem::CountAll => Value::Int(rows.len() as i64),
+        BoundSelectItem::Count { index, .. } => Value::Int(count_non_null(rows, *index)),
         BoundSelectItem::Sum { index, .. } => sum_int_column(rows, *index),
         BoundSelectItem::Min { index, .. } => extremum_column(rows, *index, Ordering::Less),
         BoundSelectItem::Max { index, .. } => extremum_column(rows, *index, Ordering::Greater),
         BoundSelectItem::Avg { index, .. } => avg_int_column(rows, *index),
+        BoundSelectItem::Case {
+            when,
+            then_value,
+            else_value,
+            ..
+        } => {
+            if matches_group(rows, Some(when.as_ref())) {
+                then_value.clone()
+            } else {
+                else_value.clone()
+            }
+        }
     }
+}
+
+fn count_non_null(rows: &[Row], index: usize) -> i64 {
+    rows.iter().filter(|row| !row[index].is_null()).count() as i64
 }
 
 fn sum_int_column(rows: &[Row], index: usize) -> Value {
@@ -894,16 +1031,32 @@ fn matches_group(rows: &[Row], predicate: Option<&BoundPredicate>) -> bool {
         Some(BoundPredicate::Comparison { expr, op, value }) => {
             compare_values(&eval_bound_item(rows, expr), *op, value)
         }
-        Some(BoundPredicate::Between { expr, low, high }) => {
+        Some(BoundPredicate::Between {
+            expr,
+            low,
+            high,
+            negated,
+        }) => {
             let left = eval_bound_item(rows, expr);
-            compare_values(&left, ComparisonOp::Gte, low)
-                && compare_values(&left, ComparisonOp::Lte, high)
+            let in_range = compare_values(&left, ComparisonOp::Gte, low)
+                && compare_values(&left, ComparisonOp::Lte, high);
+            if *negated {
+                !left.is_null() && !in_range
+            } else {
+                in_range
+            }
         }
-        Some(BoundPredicate::InList { expr, values }) => {
+        Some(BoundPredicate::InList {
+            expr,
+            values,
+            negated,
+        }) => {
             let left = eval_bound_item(rows, expr);
-            values
-                .iter()
-                .any(|value| compare_values(&left, ComparisonOp::Eq, value))
+            in_list_matches(&left, values, *negated)
+        }
+        Some(BoundPredicate::IsNull { expr, negated }) => {
+            let left = eval_bound_item(rows, expr);
+            left.is_null() != *negated
         }
         Some(BoundPredicate::Like {
             column_index,
@@ -1108,6 +1261,81 @@ fn delete(
     }
 
     Ok(QueryResult::RowsDeleted { count: deleted })
+}
+
+fn alter_table_add_column(
+    db: &mut Database,
+    table_name: &str,
+    column: Column,
+) -> Result<QueryResult> {
+    let table_name = normalize_identifier(table_name);
+    db.acquire_write_lock(&table_name)?;
+    let column_name = column.name.clone();
+    let table = db
+        .tables
+        .get_mut(&table_name)
+        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+    table.add_column(column)?;
+    db.record_undo(UndoRecord::AddColumn {
+        table: table_name.clone(),
+    });
+    Ok(QueryResult::ColumnAdded {
+        table: table_name,
+        column: column_name,
+    })
+}
+
+fn copy_to(db: &mut Database, table_name: &str, path: &str) -> Result<QueryResult> {
+    let table_name = normalize_identifier(table_name);
+    db.acquire_read_lock(&table_name)?;
+    let table = db
+        .tables
+        .get(&table_name)
+        .ok_or_else(|| DbError::TableNotFound(table_name.clone()))?;
+
+    let mut output = String::new();
+    let header = table
+        .schema
+        .column_names()
+        .iter()
+        .map(|name| csv_escape_field(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    output.push_str(&header);
+    output.push('\n');
+
+    let mut count = 0;
+    for row in table.rows() {
+        let line = row
+            .iter()
+            .map(csv_export_value)
+            .collect::<Vec<_>>()
+            .join(",");
+        output.push_str(&line);
+        output.push('\n');
+        count += 1;
+    }
+
+    fs::write(path, output)?;
+    Ok(QueryResult::RowsExported {
+        path: path.to_string(),
+        count,
+    })
+}
+
+fn csv_export_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        other => csv_escape_field(&other.to_string()),
+    }
+}
+
+fn csv_escape_field(field: &str) -> String {
+    if field.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
 }
 
 fn copy_from(db: &mut Database, table_name: &str, path: &str) -> Result<QueryResult> {
@@ -1335,7 +1563,7 @@ fn analyze(db: &mut Database, table: Option<&str>) -> Result<QueryResult> {
 
 fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
     let plan = match statement {
-        Statement::Select(query) => explain_select(db, &select_query(query))?,
+        Statement::Select(query) => explain_select_statement(db, query)?,
         Statement::Insert {
             table,
             source: InsertSource::Values(_),
@@ -1344,7 +1572,7 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
             table,
             source: InsertSource::Select(query),
         } => {
-            let plan = explain_select(db, &select_query(query))?;
+            let plan = explain_select_statement(db, query)?;
             let indented = plan
                 .lines()
                 .map(|line| format!("    {line}"))
@@ -1387,10 +1615,39 @@ fn explain(db: &Database, statement: &Statement) -> Result<QueryResult> {
                 normalize_identifier(table)
             )
         }
+        Statement::CopyTo { table, path } => {
+            format!(
+                "CopyTo\n  Table: {}\n  Path: {path}",
+                normalize_identifier(table)
+            )
+        }
+        Statement::AlterTable { table, column } => {
+            format!(
+                "AlterTable\n  Table: {}\n  Add: {} {}",
+                normalize_identifier(table),
+                column.name,
+                column.data_type
+            )
+        }
         other => format!("{other:?}"),
     };
 
     Ok(QueryResult::Plan { plan })
+}
+
+fn explain_select_statement(db: &Database, query: &SelectStatement) -> Result<String> {
+    let mut plan = explain_select(db, &select_query(query))?;
+    for part in &query.unions {
+        let kind = if part.all { "Union All" } else { "Union" };
+        let arm = explain_select(db, &select_query(&part.query))?;
+        let indented = arm
+            .lines()
+            .map(|line| format!("    {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        plan.push_str(&format!("\n  {kind}:\n{indented}"));
+    }
+    Ok(plan)
 }
 
 fn explain_select(db: &Database, query: &SelectQuery<'_>) -> Result<String> {
@@ -1500,10 +1757,19 @@ fn format_select_item(item: &SelectItem) -> String {
     match item {
         SelectItem::Column(column) => column.clone(),
         SelectItem::CountAll => "COUNT(*)".into(),
+        SelectItem::Count(column) => format!("COUNT({column})"),
         SelectItem::Sum(column) => format!("SUM({column})"),
         SelectItem::Min(column) => format!("MIN({column})"),
         SelectItem::Max(column) => format!("MAX({column})"),
         SelectItem::Avg(column) => format!("AVG({column})"),
+        SelectItem::Case {
+            when,
+            then_value,
+            else_value,
+        } => format!(
+            "CASE WHEN {} THEN {then_value} ELSE {else_value} END",
+            format_predicate(when)
+        ),
     }
 }
 
@@ -1512,16 +1778,31 @@ fn format_predicate(predicate: &Predicate) -> String {
         Predicate::Comparison { expr, op, value } => {
             format!("{} {} {value}", format_select_item(expr), format_op(*op))
         }
-        Predicate::Between { expr, low, high } => {
-            format!("{} BETWEEN {low} AND {high}", format_select_item(expr))
+        Predicate::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let op = if *negated { "NOT BETWEEN" } else { "BETWEEN" };
+            format!("{} {op} {low} AND {high}", format_select_item(expr))
         }
-        Predicate::InList { expr, values } => {
+        Predicate::InList {
+            expr,
+            values,
+            negated,
+        } => {
             let list = values
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{} IN ({list})", format_select_item(expr))
+            let op = if *negated { "NOT IN" } else { "IN" };
+            format!("{} {op} ({list})", format_select_item(expr))
+        }
+        Predicate::IsNull { expr, negated } => {
+            let op = if *negated { "IS NOT NULL" } else { "IS NULL" };
+            format!("{} {op}", format_select_item(expr))
         }
         Predicate::Like {
             column,
@@ -1628,6 +1909,7 @@ fn index_values(predicate: Option<&BoundPredicate>) -> Option<(usize, Vec<Value>
         Some(BoundPredicate::InList {
             expr: BoundSelectItem::Column { index, .. },
             values,
+            negated: false,
         }) => Some((*index, values.clone())),
         Some(BoundPredicate::And(left, right)) => {
             index_values(Some(left)).or_else(|| index_values(Some(right)))
@@ -1686,7 +1968,12 @@ fn resolve_query_predicate_inner(
                 value: value.clone(),
             })
         }
-        Predicate::Between { expr, low, high } => {
+        Predicate::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
             let expr = bind_predicate_expr(schema, expr, allow_aggregates)?;
             validate_expr_value(schema, &expr, low)?;
             validate_expr_value(schema, &expr, high)?;
@@ -1694,9 +1981,14 @@ fn resolve_query_predicate_inner(
                 expr,
                 low: low.clone(),
                 high: high.clone(),
+                negated: *negated,
             })
         }
-        Predicate::InList { expr, values } => {
+        Predicate::InList {
+            expr,
+            values,
+            negated,
+        } => {
             let expr = bind_predicate_expr(schema, expr, allow_aggregates)?;
             for value in values {
                 validate_expr_value(schema, &expr, value)?;
@@ -1704,6 +1996,14 @@ fn resolve_query_predicate_inner(
             Ok(BoundPredicate::InList {
                 expr,
                 values: values.clone(),
+                negated: *negated,
+            })
+        }
+        Predicate::IsNull { expr, negated } => {
+            let expr = bind_predicate_expr(schema, expr, allow_aggregates)?;
+            Ok(BoundPredicate::IsNull {
+                expr,
+                negated: *negated,
             })
         }
         Predicate::Like {
@@ -1779,8 +2079,23 @@ fn validate_expr_value(schema: &QuerySchema, expr: &BoundSelectItem, value: &Val
         BoundSelectItem::Min { index, .. } | BoundSelectItem::Max { index, .. } => {
             (schema.columns[*index].data_type.clone(), expr.output_name())
         }
-        BoundSelectItem::CountAll | BoundSelectItem::Sum { .. } | BoundSelectItem::Avg { .. } => {
-            (DataType::Int, expr.output_name())
+        BoundSelectItem::CountAll
+        | BoundSelectItem::Count { .. }
+        | BoundSelectItem::Sum { .. }
+        | BoundSelectItem::Avg { .. } => (DataType::Int, expr.output_name()),
+        BoundSelectItem::Case { then_value, .. } => {
+            if then_value.is_null() {
+                return Ok(());
+            }
+            return if value.type_name() == then_value.type_name() {
+                Ok(())
+            } else {
+                Err(DbError::TypeMismatch {
+                    column: expr.output_name(),
+                    expected: then_value.type_name().to_string(),
+                    got: value.type_name().to_string(),
+                })
+            };
         }
     };
 
@@ -1809,6 +2124,19 @@ fn resolve_column(schema: &TableSchema, column: &str) -> Result<usize> {
 
 fn matches_predicate(row: &Row, predicate: Option<&BoundPredicate>) -> bool {
     matches_group(std::slice::from_ref(row), predicate)
+}
+
+fn in_list_matches(left: &Value, values: &[Value], negated: bool) -> bool {
+    let matched = values
+        .iter()
+        .any(|value| compare_values(left, ComparisonOp::Eq, value));
+    if !negated {
+        return matched;
+    }
+    if left.is_null() || (!matched && values.iter().any(Value::is_null)) {
+        return false;
+    }
+    !matched
 }
 
 fn compare_values(left: &Value, op: ComparisonOp, right: &Value) -> bool {

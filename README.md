@@ -19,13 +19,16 @@ Implemented SQL-facing features:
 - `CREATE TABLE`
 - `CREATE INDEX` and `CREATE UNIQUE INDEX`
 - `INSERT INTO ... VALUES` and `INSERT INTO dest SELECT ... FROM src`
-- `SELECT`, `SELECT DISTINCT`, projection, `COUNT(*)`, `SUM` / `MIN` / `MAX` / `AVG(column)` (`AVG` is truncated integer division), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT n OFFSET m`
+- `SELECT`, `SELECT DISTINCT`, projection, `COUNT(*)`, `COUNT(column)` (non-null), `SUM` / `MIN` / `MAX` / `AVG(column)` (`AVG` is truncated integer division), `WHERE`, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT n OFFSET m`
 - `INNER JOIN` / `JOIN` and `LEFT JOIN` with nested-loop execution
 - Qualified columns (`users.name`) plus unambiguous short names after a join
-- Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `BETWEEN`, `IN (...)`, `AND`, `OR`
+- Predicates: `=`, `!=`, `<`, `<=`, `>`, `>=`, `LIKE`, `BETWEEN`, `NOT BETWEEN`, `IN (...)`, `NOT IN (...)`, `IS NULL`, `IS NOT NULL`, `AND`, `OR`
+- `CASE WHEN pred THEN v1 ELSE v2 END` in the SELECT list
+- `UNION` and `UNION ALL` (same column count; `UNION` deduplicates)
 - `UPDATE ... SET ... WHERE ...`
 - `DELETE FROM ... WHERE ...`
-- `COPY table FROM 'file.csv'` and REPL `.import <path> <table>` (CSV header = columns)
+- `ALTER TABLE t ADD COLUMN c INT` (nullable; existing rows get `NULL`)
+- `COPY table FROM 'file.csv'` / `COPY table TO 'file.csv'` and REPL `.import` / `.export` (CSV header = columns)
 - `EXPLAIN` for scan vs index lookup, nested-loop join, hash aggregation, `HAVING`, and `DISTINCT`
 - `BEGIN`, `COMMIT`, `ROLLBACK` with an in-memory undo log
 - `ANALYZE` collects per-table statistics used by `EXPLAIN`
@@ -34,7 +37,7 @@ Implemented SQL-facing features:
 - Table-level lock manager integrated with active transactions
 - O(1) row lookup via hash-backed table storage
 - Strict type checking
-- REPL meta commands: `.tables`, `.schema`, `.import`, `.help`
+- REPL meta commands: `.tables`, `.schema`, `.import`, `.export`, `.help`
 - Persistent storage with snapshot files + append-only WAL replay
 - `Database::open(path)` and `cargo run -- <data-dir>` for durable sessions
 - `CHECKPOINT` writes a snapshot and truncates the WAL
@@ -79,11 +82,18 @@ WHERE orders.total > 100;
 SELECT active, COUNT(*), SUM(id) FROM users GROUP BY active HAVING COUNT(*) > 0;
 SELECT DISTINCT active FROM users;
 SELECT MIN(id), MAX(id), AVG(id) FROM users;
+SELECT COUNT(email) FROM users;
 SELECT name FROM users WHERE name LIKE 'Ada%';
 SELECT id FROM users WHERE id BETWEEN 1 AND 10;
 SELECT name FROM users WHERE id IN (1, 2);
+SELECT id FROM users WHERE email IS NULL;
+SELECT id FROM users WHERE id NOT IN (1, 2);
+SELECT name, CASE WHEN active = true THEN 'yes' ELSE 'no' END FROM users;
+SELECT id FROM users UNION SELECT id FROM archived;
 INSERT INTO archived SELECT id, email, name, active FROM users WHERE active = false;
+ALTER TABLE users ADD COLUMN nickname TEXT;
 COPY users FROM 'users.csv';
+COPY users TO 'users-out.csv';
 
 BEGIN;
 UPDATE users SET active = true WHERE id = 2;
@@ -112,6 +122,7 @@ db> CREATE TABLE users (id INT, name TEXT, active BOOL);
 db> INSERT INTO users VALUES (1, 'Ada Lovelace', true);
 db> SELECT * FROM users;
 db> .import users.csv users
+db> .export users-out.csv users
 db> .quit
 ```
 
@@ -156,6 +167,7 @@ tests/
   advanced_sql.rs Constraints, indexes, predicates, transactions
   v03_sql.rs      JOIN, GROUP BY, LIKE, OFFSET, CSV import
   v04_sql.rs      HAVING, DISTINCT, INSERT SELECT, MIN/MAX/AVG, BETWEEN, IN
+  v05_sql.rs      IS NULL, NOT IN / NOT BETWEEN, COUNT(col), UNION, CASE, ALTER, COPY TO
   internals.rs    Locking, pages, B+ tree, WAL, statistics
 docs/
   ARCHITECTURE.md Design notes and trade-offs

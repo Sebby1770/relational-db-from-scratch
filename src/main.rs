@@ -89,12 +89,14 @@ fn handle_meta_command(db: &mut Database, input: &str) -> Option<String> {
                 "  .schema <table>    show table schema and indexes",
                 "  .import <path> <table>",
                 "                      load a CSV file (header row = column names)",
+                "  .export <path> <table>",
+                "                      write a CSV file (header row = column names)",
                 "  .storage           show persistence directory status",
                 "  .checkpoint        flush snapshot + truncate WAL",
                 "  .help              show this help",
                 "  .quit / .exit      leave the REPL",
                 "",
-                "SELECT supports DISTINCT, INNER/LEFT JOIN, GROUP BY, HAVING, LIKE, BETWEEN, IN, LIMIT n OFFSET m.",
+                "SELECT supports DISTINCT, UNION [ALL], CASE WHEN, INNER/LEFT JOIN, GROUP BY, HAVING, LIKE, BETWEEN, IN, IS NULL, LIMIT n OFFSET m.",
                 "Launch with a data directory to enable WAL logging and CHECKPOINT snapshots.",
             ]
             .join("\n"),
@@ -123,6 +125,18 @@ fn handle_meta_command(db: &mut Database, input: &str) -> Option<String> {
             let table = args[args.len() - 1];
             let path = args[..args.len() - 1].join(" ");
             match db.import_csv(path, table) {
+                Ok(result) => Some(result.format_for_display()),
+                Err(error) => Some(format!("error: {error}")),
+            }
+        }
+        ".export" => {
+            let args = parts.collect::<Vec<_>>();
+            if args.len() < 2 {
+                return Some("usage: .export <path> <table>".into());
+            }
+            let table = args[args.len() - 1];
+            let path = args[..args.len() - 1].join(" ");
+            match db.export_csv(path, table) {
                 Ok(result) => Some(result.format_for_display()),
                 Err(error) => Some(format!("error: {error}")),
             }

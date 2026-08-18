@@ -26,6 +26,9 @@ pub enum UndoRecord {
         row_id: RowId,
         old_row: Row,
     },
+    AddColumn {
+        table: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

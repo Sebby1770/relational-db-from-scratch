@@ -4,7 +4,8 @@ use crate::codec::IndexDefinition;
 use crate::error::{DbError, Result};
 use crate::index::SecondaryIndex;
 use crate::row::Row;
-use crate::schema::{TableSchema, normalize_identifier};
+use crate::schema::{Column, TableSchema, normalize_identifier};
+use crate::value::Value;
 
 pub type RowId = u64;
 
@@ -111,6 +112,43 @@ impl Table {
         }
 
         Ok(StoredRow { row_id, row })
+    }
+
+    pub fn add_column(&mut self, column: Column) -> Result<()> {
+        let mut column = column;
+        column.name = normalize_identifier(&column.name);
+        if self.schema.column_index(&column.name).is_some() {
+            return Err(DbError::ColumnExists(column.name));
+        }
+        if column.primary_key {
+            return Err(DbError::InvalidStatement(
+                "ALTER TABLE ADD COLUMN does not support PRIMARY KEY".into(),
+            ));
+        }
+        if !column.nullable {
+            return Err(DbError::InvalidStatement(
+                "ALTER TABLE ADD COLUMN requires a nullable column".into(),
+            ));
+        }
+
+        self.schema.columns.push(column);
+        for row in self.rows.values_mut() {
+            row.push(Value::Null);
+        }
+        Ok(())
+    }
+
+    pub fn drop_trailing_column(&mut self) -> Result<()> {
+        if self.schema.columns.len() <= 1 {
+            return Err(DbError::InvalidStatement(
+                "cannot drop the last column".into(),
+            ));
+        }
+        self.schema.columns.pop();
+        for row in self.rows.values_mut() {
+            row.pop();
+        }
+        Ok(())
     }
 
     pub fn create_index(

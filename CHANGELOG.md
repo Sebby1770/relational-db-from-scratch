@@ -2,6 +2,22 @@
 
 All notable changes to **relational-db-from-scratch** are documented here.
 
+## [0.5.0] - 2026-08-18
+
+### Added
+- `IS NULL` and `IS NOT NULL` predicates
+- `NOT IN` and `NOT BETWEEN` predicates
+- `COUNT(column)` counts non-null values, distinct from `COUNT(*)`
+- `UNION` (deduplicating) and `UNION ALL` of SELECT statements with matching column counts
+- `CASE WHEN pred THEN v1 ELSE v2 END` in the SELECT list
+- `ALTER TABLE t ADD COLUMN c INT` appends a nullable column (existing rows become `NULL`)
+- CSV export via `COPY table TO 'path.csv'` and the REPL meta command `.export <path> <table>`
+- Integration tests for the 0.5 query surface
+
+### Changed
+- README, roadmap snapshot, and SQL examples cover NULL predicates, UNION, CASE, ALTER, and CSV export
+- `SELECT` AST now carries `UNION` tails; `COPY` accepts `FROM` or `TO`
+
 ## [0.4.0] - 2026-08-18
 
 ### Added

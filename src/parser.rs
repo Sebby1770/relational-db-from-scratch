@@ -38,6 +38,14 @@ pub enum Statement {
         table: String,
         path: String,
     },
+    CopyTo {
+        table: String,
+        path: String,
+    },
+    AlterTable {
+        table: String,
+        column: Column,
+    },
     Explain(Box<Statement>),
     Begin,
     Commit,
@@ -75,21 +83,42 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderBy>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    pub unions: Vec<UnionPart>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnionPart {
+    pub all: bool,
+    pub query: SelectStatement,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
     Column(String),
     CountAll,
+    Count(String),
     Sum(String),
     Min(String),
     Max(String),
     Avg(String),
+    Case {
+        when: Box<Predicate>,
+        then_value: Value,
+        else_value: Value,
+    },
 }
 
 impl SelectItem {
     pub fn is_aggregate(&self) -> bool {
-        !matches!(self, SelectItem::Column(_))
+        matches!(
+            self,
+            SelectItem::CountAll
+                | SelectItem::Count(_)
+                | SelectItem::Sum(_)
+                | SelectItem::Min(_)
+                | SelectItem::Max(_)
+                | SelectItem::Avg(_)
+        )
     }
 }
 
@@ -119,10 +148,16 @@ pub enum Predicate {
         expr: SelectItem,
         low: Value,
         high: Value,
+        negated: bool,
     },
     InList {
         expr: SelectItem,
         values: Vec<Value>,
+        negated: bool,
+    },
+    IsNull {
+        expr: SelectItem,
+        negated: bool,
     },
     Like {
         column: String,
@@ -358,6 +393,17 @@ fn is_reserved_after_table(value: &str) -> bool {
             | "DISTINCT"
             | "BETWEEN"
             | "IN"
+            | "NOT"
+            | "IS"
+            | "NULL"
+            | "CASE"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+            | "ALL"
+            | "ALTER"
+            | "ADD"
     )
 }
 
@@ -400,6 +446,10 @@ impl Parser {
 
         if self.consume_keyword("COPY") {
             return self.parse_copy();
+        }
+
+        if self.consume_keyword("ALTER") {
+            return self.parse_alter();
         }
 
         if self.consume_keyword("DROP") {
@@ -552,18 +602,50 @@ impl Parser {
 
     fn parse_copy(&mut self) -> Result<Statement> {
         let table = self.expect_ident()?;
-        self.expect_keyword("FROM")?;
-        let path = match self.advance() {
-            Some(Token::String(path)) => path,
-            Some(other) => {
-                return Err(DbError::Parse(format!(
-                    "expected csv path string, got {other:?}"
-                )));
-            }
-            None => return Err(DbError::Parse("expected csv path string".into())),
-        };
+        if self.consume_keyword("FROM") {
+            return Ok(Statement::CopyFrom {
+                table,
+                path: self.expect_csv_path()?,
+            });
+        }
+        if self.consume_keyword("TO") {
+            return Ok(Statement::CopyTo {
+                table,
+                path: self.expect_csv_path()?,
+            });
+        }
+        Err(DbError::Parse(
+            "expected FROM or TO after COPY table".into(),
+        ))
+    }
 
-        Ok(Statement::CopyFrom { table, path })
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect_keyword("TABLE")?;
+        let table = self.expect_ident()?;
+        self.expect_keyword("ADD")?;
+        self.expect_keyword("COLUMN")?;
+        let column_name = self.expect_ident()?;
+        let data_type = self.parse_data_type()?;
+        if self.consume_keyword("NOT") {
+            return Err(DbError::Parse(
+                "ALTER TABLE ADD COLUMN does not support NOT NULL".into(),
+            ));
+        }
+        let _ = self.consume_keyword("NULL");
+        Ok(Statement::AlterTable {
+            table,
+            column: Column::new(column_name, data_type),
+        })
+    }
+
+    fn expect_csv_path(&mut self) -> Result<String> {
+        match self.advance() {
+            Some(Token::String(path)) => Ok(path),
+            Some(other) => Err(DbError::Parse(format!(
+                "expected csv path string, got {other:?}"
+            ))),
+            None => Err(DbError::Parse("expected csv path string".into())),
+        }
     }
 
     fn parse_select(&mut self) -> Result<Statement> {
@@ -571,6 +653,21 @@ impl Parser {
     }
 
     fn parse_select_statement(&mut self) -> Result<SelectStatement> {
+        let mut query = self.parse_select_core()?;
+        while self.consume_keyword("UNION") {
+            let all = self.consume_keyword("ALL");
+            self.expect_keyword("SELECT")?;
+            let right = self.parse_select_core()?;
+            query.unions.push(UnionPart { all, query: right });
+        }
+        query.order_by = self.parse_order_by_list()?;
+        let (limit, offset) = self.parse_optional_limit_offset()?;
+        query.limit = limit;
+        query.offset = offset;
+        Ok(query)
+    }
+
+    fn parse_select_core(&mut self) -> Result<SelectStatement> {
         let distinct = self.consume_keyword("DISTINCT");
         let projection = self.parse_projection()?;
         self.expect_keyword("FROM")?;
@@ -579,8 +676,6 @@ impl Parser {
         let predicate = self.parse_optional_predicate()?;
         let group_by = self.parse_optional_group_by()?;
         let having = self.parse_optional_having()?;
-        let order_by = self.parse_order_by_list()?;
-        let (limit, offset) = self.parse_optional_limit_offset()?;
 
         Ok(SelectStatement {
             distinct,
@@ -591,9 +686,10 @@ impl Parser {
             predicate,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+            unions: Vec::new(),
         })
     }
 
@@ -632,12 +728,20 @@ impl Parser {
     }
 
     fn parse_select_item(&mut self) -> Result<SelectItem> {
+        if self.consume_keyword("CASE") {
+            return self.parse_case();
+        }
+
         if self.peek_function("COUNT") {
             self.advance();
             self.expect(Token::LParen)?;
-            self.expect(Token::Star)?;
+            if self.consume(Token::Star) {
+                self.expect(Token::RParen)?;
+                return Ok(SelectItem::CountAll);
+            }
+            let column = self.parse_column_ref()?;
             self.expect(Token::RParen)?;
-            return Ok(SelectItem::CountAll);
+            return Ok(SelectItem::Count(column));
         }
 
         if self.peek_function("SUM") {
@@ -673,6 +777,21 @@ impl Parser {
         }
 
         Ok(SelectItem::Column(self.parse_column_ref()?))
+    }
+
+    fn parse_case(&mut self) -> Result<SelectItem> {
+        self.expect_keyword("WHEN")?;
+        let when = self.parse_or()?;
+        self.expect_keyword("THEN")?;
+        let then_value = self.parse_literal()?;
+        self.expect_keyword("ELSE")?;
+        let else_value = self.parse_literal()?;
+        self.expect_keyword("END")?;
+        Ok(SelectItem::Case {
+            when: Box::new(when),
+            then_value,
+            else_value,
+        })
     }
 
     fn parse_table_ref(&mut self) -> Result<(String, Option<String>)> {
@@ -797,15 +916,22 @@ impl Parser {
         }
 
         let expr = self.parse_select_item()?;
+        if self.consume_keyword("NOT") {
+            if self.consume_keyword("BETWEEN") {
+                return self.parse_between(expr, true);
+            }
+            if self.consume_keyword("IN") {
+                return self.parse_in_list(expr, true);
+            }
+            return Err(DbError::Parse("expected BETWEEN or IN after NOT".into()));
+        }
+
         if self.consume_keyword("BETWEEN") {
-            let low = self.parse_literal()?;
-            self.expect_keyword("AND")?;
-            let high = self.parse_literal()?;
-            return Ok(Predicate::Between { expr, low, high });
+            return self.parse_between(expr, false);
         }
 
         if self.consume_keyword("IN") {
-            return self.parse_in_list(expr);
+            return self.parse_in_list(expr, false);
         }
 
         if self.consume_keyword("LIKE") {
@@ -817,12 +943,30 @@ impl Parser {
             return self.parse_like(column);
         }
 
+        if self.consume_keyword("IS") {
+            let negated = self.consume_keyword("NOT");
+            self.expect_keyword("NULL")?;
+            return Ok(Predicate::IsNull { expr, negated });
+        }
+
         let op = self.parse_comparison_op()?;
         let value = self.parse_literal()?;
         Ok(Predicate::Comparison { expr, op, value })
     }
 
-    fn parse_in_list(&mut self, expr: SelectItem) -> Result<Predicate> {
+    fn parse_between(&mut self, expr: SelectItem, negated: bool) -> Result<Predicate> {
+        let low = self.parse_literal()?;
+        self.expect_keyword("AND")?;
+        let high = self.parse_literal()?;
+        Ok(Predicate::Between {
+            expr,
+            low,
+            high,
+            negated,
+        })
+    }
+
+    fn parse_in_list(&mut self, expr: SelectItem, negated: bool) -> Result<Predicate> {
         self.expect(Token::LParen)?;
         let mut values = Vec::new();
         loop {
@@ -835,7 +979,11 @@ impl Parser {
         if values.is_empty() {
             return Err(DbError::Parse("expected value in IN list".into()));
         }
-        Ok(Predicate::InList { expr, values })
+        Ok(Predicate::InList {
+            expr,
+            values,
+            negated,
+        })
     }
 
     fn parse_like(&mut self, column: String) -> Result<Predicate> {

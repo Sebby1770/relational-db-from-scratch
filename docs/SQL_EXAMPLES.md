@@ -79,6 +79,8 @@ HAVING SUM(total) > 500;
 
 SELECT DISTINCT user_id FROM orders;
 SELECT MIN(total), MAX(total), AVG(total) FROM orders;
+SELECT COUNT(email) FROM users;
+SELECT name, CASE WHEN active = true THEN 'yes' ELSE 'no' END FROM users;
 ```
 
 ## Sorting and Limits
@@ -94,6 +96,10 @@ SELECT name FROM users WHERE name LIKE 'Ada%';
 SELECT name FROM users WHERE name LIKE '%Hopper';
 SELECT id FROM users WHERE id BETWEEN 1 AND 10;
 SELECT name FROM users WHERE id IN (1, 2);
+SELECT id FROM users WHERE id NOT BETWEEN 1 AND 10;
+SELECT name FROM users WHERE id NOT IN (1, 2);
+SELECT id FROM users WHERE email IS NULL;
+SELECT id FROM users WHERE email IS NOT NULL;
 ```
 
 ## INSERT SELECT
@@ -111,18 +117,41 @@ JOIN orders ON users.id = orders.user_id
 WHERE orders.total > 100;
 ```
 
-## CSV import
+## UNION
 
-Header row names the columns. Extra table columns that are nullable become `NULL`.
+```sql
+SELECT id FROM users
+UNION
+SELECT id FROM archived
+ORDER BY id;
+
+SELECT name FROM users
+UNION ALL
+SELECT name FROM archived;
+```
+
+## ALTER TABLE
+
+```sql
+ALTER TABLE users ADD COLUMN nickname TEXT;
+```
+
+Existing rows receive `NULL` in the new column.
+
+## CSV import and export
+
+Header row names the columns. Extra table columns that are nullable become `NULL`. Export writes the header plus every row.
 
 ```sql
 COPY users FROM 'users.csv';
+COPY users TO 'users-out.csv';
 ```
 
 In the REPL:
 
 ```text
 .import users.csv users
+.export users-out.csv users
 ```
 
 ## Transactions
