@@ -1,6 +1,8 @@
 # Changelog
 
-All notable changes to **relational-db-from-scratch** are documented here.
+## 0.3.0
+
+The default Cargo application is now Meridian, a native real-time CPU ray tracer. It includes an orbit camera, animated sunlight, progressive sampling and headless PNG export. Earlier entries describe the original database project.
 
 ## [0.2.0] - 2026-07-04
 

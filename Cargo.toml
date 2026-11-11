@@ -1,9 +1,13 @@
 [package]
-name = "relational-db-from-scratch"
-version = "0.2.0"
+name = "real-time-ray-tracer"
+version = "0.3.0"
 edition = "2024"
-description = "An educational SQLite-inspired relational database built from scratch in Rust."
+description = "An interactive CPU ray tracer written in Rust."
 readme = "README.md"
 license = "MIT"
 
 [dependencies]
+glam = "0.30"
+minifb = { version = "0.28", default-features = false, features = ["x11"] }
+png = "0.18"
+rayon = "1.11"
